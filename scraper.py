@@ -16,7 +16,8 @@ nest_asyncio.apply()
 # =====================================================================
 # DIRECT POSTGRESQL DATABASE CONFIGURATION
 # =====================================================================
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres.vzixjxeppvpxrhntaidb:l0aDck2NUeD4Jws5@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres")
+# Hardcoded to prevent GitHub Secrets from overriding it with the old DB URL
+DATABASE_URL = "postgresql://postgres.vzixjxeppvpxrhntaidb:l0aDck2NUeD4Jws5@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
