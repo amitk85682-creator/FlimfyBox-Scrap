@@ -520,10 +520,10 @@ def get_tmdb_details(fixed_data):
 # =====================================================================
 async def scrape_and_save_movie(movie_link, browser, main_context, sem):
     if check_movie_in_db(movie_link):
-        print(f"⏩ SKIP: Already in Database -> {movie_link}")
+        print(f"⏩ SKIP: Already in Database -> {movie_link}", flush=True)
         return
 
-    print(f"\n🎬 EXTRACTING: {movie_link}")
+    print(f"\n🎬 EXTRACTING: {movie_link}", flush=True)
     movie_page = await main_context.new_page()
     try:
         await movie_page.goto(movie_link, timeout=60000, wait_until="domcontentloaded")
@@ -793,15 +793,15 @@ async def master_auto_scraper():
                 
                 print(f"📋 Found {len(movies_on_page)} movies on page {page_num}", flush=True)
 
+                # 1. Check for Postgres Hourly Flag (ONCE PER PAGE)
+                await run_hourly_check(browser, main_context, sem)
+
                 for movie_link in movies_on_page:
                     # ⏱️ TIME CHECK EVERY MOVIE (For GitHub Relay)
                     if time.time() - start_time > MAX_RUN_TIME:
                         print("⏳ Time limit reaching! Handing over to next runner...", flush=True)
                         trigger_next_github_runner()
                         sys.exit(0)
-
-                    # 1. Check for Postgres Hourly Flag
-                    await run_hourly_check(browser, main_context, sem)
                     
                     # 2. Process Movie (Skips if already in Postgres DB)
                     await scrape_and_save_movie(movie_link, browser, main_context, sem)
