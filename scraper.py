@@ -19,7 +19,7 @@ nest_asyncio.apply()
 DATABASE_URL = "postgresql://postgres.vzixjxeppvpxrhntaidb:l0aDck2NUeD4Jws5@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"
 
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
 
 def check_movie_in_db(url):
     try:
@@ -675,11 +675,18 @@ async def run_hourly_check(browser, main_context, sem):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        # Check if table exists first
+        cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'bot_commands');")
+        if not cur.fetchone()[0]:
+            cur.close()
+            conn.close()
+            return  # Table nahi hai, skip karo silently
+        
         cur.execute("SELECT status FROM bot_commands WHERE task = 'hourly_check';")
         res = cur.fetchone()
         
         if res and res[0] == 'pending':
-            print("\n🚨 DB HOURLY CHECK TRIGGERED! Pausing deep scraper. Checking Homepage...")
+            print("\n🚨 DB HOURLY CHECK TRIGGERED! Pausing deep scraper. Checking Homepage...", flush=True)
             page = await main_context.new_page()
             await page.goto("https://new5.hdhub4u.cl/", timeout=60000, wait_until="domcontentloaded")
             
@@ -704,10 +711,9 @@ async def run_hourly_check(browser, main_context, sem):
             for movie_link in movies_on_page:
                 await scrape_and_save_movie(movie_link, browser, main_context, sem)
             
-            # Update status back to done
             cur.execute("UPDATE bot_commands SET status = 'done' WHERE task = 'hourly_check';")
             conn.commit()
-            print("▶️ Hourly Check complete! DB Status set to 'done'. Resuming Deep Scraper...\n")
+            print("▶️ Hourly Check complete! Resuming...\n", flush=True)
         
         cur.close()
         conn.close()
