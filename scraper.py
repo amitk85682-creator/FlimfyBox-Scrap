@@ -9,7 +9,6 @@ import time
 import sys
 import psycopg2
 from playwright.async_api import async_playwright
-from pyvirtualdisplay import Display
 
 nest_asyncio.apply()
 
@@ -719,9 +718,7 @@ async def run_hourly_check(browser, main_context, sem):
 # 🚀 MASTER DEEP SCRAPER (Runs Endlessly with GitHub Relay)
 # =====================================================================
 async def master_auto_scraper():
-    print("🖥️ Starting Virtual Display...")
-    main_display = Display(visible=0, size=(1920, 1080))
-    main_display.start()
+    print("🚀 Starting Scraper (xvfb-run handles display)...")
     
     start_time = time.time()
     MAX_RUN_TIME = (5 * 3600) + (45 * 60) # 5 Hours 45 Minutes limit for GitHub
@@ -729,7 +726,7 @@ async def master_auto_scraper():
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=False, 
+                headless=True,   # CI mein headless=True zaroori hai
                 args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
             )
             main_context = await browser.new_context(
@@ -791,8 +788,6 @@ async def master_auto_scraper():
 
     except KeyboardInterrupt:
         print("\n🛑 Process stopped manually.")
-    finally:
-        main_display.stop()
 
 if __name__ == "__main__":
     asyncio.run(master_auto_scraper())
