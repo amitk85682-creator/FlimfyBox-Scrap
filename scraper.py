@@ -757,12 +757,15 @@ async def master_auto_scraper():
             print("✅ Browser ready, starting scrape!", flush=True)
 
             while current_url:
-                print(f"\n{'='*50}\n🌐 Scraping PAGE {page_num}: {current_url}\n{'='*50}")
+                print(f"\n{'='*50}", flush=True)
+                print(f"🌐 Scraping PAGE {page_num}: {current_url}", flush=True)
+                print(f"{'='*50}", flush=True)
                 
                 try:
                     await page.goto(current_url, timeout=60000, wait_until="domcontentloaded")
+                    print(f"✅ Page {page_num} loaded, extracting movie links...", flush=True)
                 except Exception as e:
-                    print(f"❌ Failed to load page {page_num}: {e}")
+                    print(f"❌ Failed to load page {page_num}: {e}", flush=True)
                     break
 
                 movies_on_page = await page.evaluate('''() => {
@@ -781,11 +784,13 @@ async def master_auto_scraper():
                     });
                     return uniqueMovies;
                 }''')
+                
+                print(f"📋 Found {len(movies_on_page)} movies on page {page_num}", flush=True)
 
                 for movie_link in movies_on_page:
                     # ⏱️ TIME CHECK EVERY MOVIE (For GitHub Relay)
                     if time.time() - start_time > MAX_RUN_TIME:
-                        print("⏳ Time limit reaching! Handing over to next runner...")
+                        print("⏳ Time limit reaching! Handing over to next runner...", flush=True)
                         trigger_next_github_runner()
                         sys.exit(0)
 
