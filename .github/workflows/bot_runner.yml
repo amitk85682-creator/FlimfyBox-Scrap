@@ -1,0 +1,30 @@
+name: 24/7 Movie Bot Scraper
+
+on:
+  workflow_dispatch: 
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install System Dependencies (For Virtual Display)
+        run: sudo apt-get install -y xvfb
+
+      - name: Install Python Packages
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: Run Scraper Bot
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: xvfb-run --auto-servernum python scraper.py

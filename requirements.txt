@@ -1,0 +1,5 @@
+playwright
+pyvirtualdisplay
+nest_asyncio
+requests
+psycopg2-binary
