@@ -583,6 +583,11 @@ async def scrape_and_save_movie(movie_link, browser, main_context, sem):
                     
                     let quality = cleanText;
                     let size = "";
+                    
+                    if (cleanText.toLowerCase().includes('sample')) {
+                        return; // Ignore sample files completely!
+                    }
+                    
                     let sizeMatch = cleanText.match(/(.*?)\\[(.*?)\\]/);
                     if (sizeMatch) {
                         quality = sizeMatch[1].trim();
