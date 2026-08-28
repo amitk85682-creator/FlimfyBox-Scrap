@@ -712,23 +712,39 @@ async def run_hourly_check(browser, main_context, sem):
         cur.close()
         conn.close()
     except Exception as e:
-        print(f"⚠️ Hourly check error: {e}")
+        print(f"⚠️ Hourly check error: {e}", flush=True)
 
 # =====================================================================
 # 🚀 MASTER DEEP SCRAPER (Runs Endlessly with GitHub Relay)
 # =====================================================================
 async def master_auto_scraper():
-    print("🚀 Starting Scraper (xvfb-run handles display)...")
+    print("=" * 60, flush=True)
+    print("🚀 SCRAPER STARTED", flush=True)
+    print(f"⏰ Time: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print("=" * 60, flush=True)
+    
+    # DB connection test
+    print("🔌 Testing Database Connection...", flush=True)
+    try:
+        test_conn = get_db_connection()
+        test_conn.close()
+        print("✅ Database Connected Successfully!", flush=True)
+    except Exception as e:
+        print(f"❌ Database Connection FAILED: {e}", flush=True)
+        print("⚠️ Continuing anyway - will retry on each operation", flush=True)
     
     start_time = time.time()
     MAX_RUN_TIME = (5 * 3600) + (45 * 60) # 5 Hours 45 Minutes limit for GitHub
 
     try:
+        print("🎭 Starting Playwright...", flush=True)
         async with async_playwright() as p:
+            print("🌐 Launching Chromium (headless=True)...", flush=True)
             browser = await p.chromium.launch(
-                headless=True,   # CI mein headless=True zaroori hai
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
             )
+            print("✅ Chromium Launched!", flush=True)
             main_context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             )
@@ -738,6 +754,7 @@ async def master_auto_scraper():
             current_url = "https://new5.hdhub4u.cl/" 
             page_num = 1
             sem = asyncio.Semaphore(20) 
+            print("✅ Browser ready, starting scrape!", flush=True)
 
             while current_url:
                 print(f"\n{'='*50}\n🌐 Scraping PAGE {page_num}: {current_url}\n{'='*50}")
