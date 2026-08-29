@@ -68,7 +68,7 @@ LANG_URL_MAP = {
 }
 
 
-def parse_episode_from_text(text):
+def parse_episode_from_text(text, fallback_text=''):
     """
     'EPiSODE 1' / 'Season 4 Episode 1' / 'S04E01' se
     (season_num_or_None, ep_num_or_None, formatted_str) return karo.
@@ -89,6 +89,13 @@ def parse_episode_from_text(text):
     m = re.search(r'(?i)(?:episode|ep|epi|episod[eo]?)\s*(\d+)', text)
     if m:
         e = int(m.group(1))
+        
+        if fallback_text:
+            m_s = re.search(r'(?i)season\s*(\d+)', fallback_text)
+            if m_s:
+                s = int(m_s.group(1))
+                return s, e, f"S{s:02d}E{e:02d}"
+                
         return None, e, f"E{e:02d}"
 
     return None, None, ""
@@ -139,13 +146,17 @@ def fix_movie_files(conn, dry_run=False, movie_id_filter=None):
 
     if movie_id_filter:
         cur.execute("""
-            SELECT id, movie_id, quality, url, file_size, languages, extra_info
-            FROM movie_files WHERE movie_id = %s ORDER BY id
+            SELECT mf.id, mf.movie_id, mf.quality, mf.url, mf.file_size, mf.languages, mf.extra_info, m.title, m.url
+            FROM movie_files mf
+            JOIN movies m ON mf.movie_id = m.id
+            WHERE mf.movie_id = %s ORDER BY mf.id
         """, (movie_id_filter,))
     else:
         cur.execute("""
-            SELECT id, movie_id, quality, url, file_size, languages, extra_info
-            FROM movie_files WHERE source = 'scraped' ORDER BY movie_id, id
+            SELECT mf.id, mf.movie_id, mf.quality, mf.url, mf.file_size, mf.languages, mf.extra_info, m.title, m.url
+            FROM movie_files mf
+            JOIN movies m ON mf.movie_id = m.id
+            WHERE mf.source = 'scraped' ORDER BY mf.movie_id, mf.id
         """)
 
     rows = cur.fetchall()
@@ -153,7 +164,7 @@ def fix_movie_files(conn, dry_run=False, movie_id_filter=None):
     fixed = 0
 
     for row in rows:
-        (fid, mid, quality, url, file_size, languages, extra_info) = row
+        (fid, mid, quality, url, file_size, languages, extra_info, m_title, m_url) = row
         quality_orig   = quality    or ""
         url_str        = url        or ""
         new_quality    = quality_orig
@@ -163,7 +174,8 @@ def fix_movie_files(conn, dry_run=False, movie_id_filter=None):
         changed = False
 
         # 1. Episode info quality column se extra_info mein
-        _, _, ep_str = parse_episode_from_text(quality_orig)
+        fallback = f"{m_title or ''} {m_url or ''}"
+        _, _, ep_str = parse_episode_from_text(quality_orig, fallback)
         if ep_str and not new_extra_info:
             new_extra_info = ep_str
             # quality se episode strip karke asli quality lo

@@ -288,7 +288,7 @@ def save_movie_to_db(data_dict):
                 'marathi':'Marathi','bengali':'Bengali',
             }
 
-            def _parse_episode(text):
+            def _parse_episode(text, fallback_text=''):
                 """Returns (extra_info_str) like 'S04E01' or '' if none."""
                 if not text: return ''
                 m = re.search(r'(?i)s(\d{1,2})\s*e(\d{1,3})', text)
@@ -296,7 +296,12 @@ def save_movie_to_db(data_dict):
                 m = re.search(r'(?i)season\s*(\d+)\s*(?:episode|ep)?\s*(\d+)', text)
                 if m: return f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}"
                 m = re.search(r'(?i)(?:episode|ep|epi)\s*(\d+)', text)
-                if m: return f"E{int(m.group(1)):02d}"
+                if m:
+                    ep_num = int(m.group(1))
+                    if fallback_text:
+                        m_s = re.search(r'(?i)season\s*(\d+)', fallback_text)
+                        if m_s: return f"S{int(m_s.group(1)):02d}E{ep_num:02d}"
+                    return f"E{ep_num:02d}"
                 return ''
 
             def _parse_quality(text):
@@ -333,7 +338,8 @@ def save_movie_to_db(data_dict):
                 def upsert_file(raw_quality, server_name_raw, srv_url, file_size):
                     """Insert/update movie_file with correctly parsed columns."""
                     # Parse episode → extra_info
-                    ep_str   = _parse_episode(raw_quality)
+                    fallback = f"{data_dict.get('url', '')}"
+                    ep_str   = _parse_episode(raw_quality, fallback)
                     # Parse real quality (480p etc.)
                     real_q   = _parse_quality(raw_quality)
                     if not real_q:
