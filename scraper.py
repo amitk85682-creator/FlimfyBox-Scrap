@@ -742,7 +742,7 @@ async def run_hourly_check(browser, main_context, sem):
 # =====================================================================
 # 🚀 MASTER DEEP SCRAPER (Runs Endlessly with GitHub Relay)
 # =====================================================================
-async def master_auto_scraper():
+async def master_auto_scraper(start_page, end_page):
     print("=" * 60, flush=True)
     print("🚀 SCRAPER STARTED", flush=True)
     print(f"⏰ Time: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
