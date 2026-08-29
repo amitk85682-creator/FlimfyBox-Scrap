@@ -469,7 +469,21 @@ def get_tmdb_details(fixed_data):
     url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_KEY}&query={urllib.parse.quote(search_query)}"
     try:
         response = requests.get(url).json()
-        if not response.get('results'): return None
+        if not response.get('results'): 
+            # Generate a unique positive integer above 900,000,000 based on the movie URL or title
+            import hashlib
+            unique_hash = int(hashlib.md5(search_query.encode()).hexdigest(), 16)
+            fallback_id = (unique_hash % 100000000) + 900000000 
+            return {
+                "Matched_Type": type_hint.upper(),
+                "Orig_Language": target_orig_lang.upper() if target_orig_lang else "UNKNOWN",
+                "Title": search_query,
+                "Release": year_hint,
+                "tmdb_id": fallback_id,
+                "Overview": "N/A",
+                "Poster": None,
+                "is_tv": type_hint == 'tv'
+            }
         results = response['results']
         best_match = None
 
@@ -798,6 +812,11 @@ async def master_auto_scraper():
                 }''')
                 
                 print(f"📋 Found {len(movies_on_page)} movies on page {page_num}", flush=True)
+                
+                if len(movies_on_page) == 0:
+                    print("⚠️ 0 movies found, skipping page", flush=True)
+                    page_num += 1
+                    continue
 
                 # 1. Check for Postgres Hourly Flag (ONCE PER PAGE)
                 await run_hourly_check(browser, main_context, sem)
@@ -808,6 +827,9 @@ async def master_auto_scraper():
                         print("⏳ Time limit reaching! Handing over to next runner...", flush=True)
                         trigger_next_github_runner()
                         sys.exit(0)
+                        
+                    tmdb_id = None
+                    movie_title = None
                     
                     # 2. Process Movie (Skips if already in Postgres DB)
                     await scrape_and_save_movie(movie_link, browser, main_context, sem)
