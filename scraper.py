@@ -351,17 +351,17 @@ def save_movie_to_db(data_dict):
                     srv_name = _clean_server_name(server_name_raw)
 
                     cur.execute(
-                        "SELECT id FROM movie_files WHERE movie_id = %s AND quality = %s AND server_name = %s",
-                        (movie_id, quality, srv_name)
+                        "SELECT id FROM movie_files WHERE movie_id = %s AND quality = %s AND server_name = %s AND extra_info = %s",
+                        (movie_id, quality, srv_name, ep_str)
                     )
                     if cur.fetchone():
                         cur.execute("""
                             UPDATE movie_files
                             SET url = %s, file_size = %s, languages = %s,
-                                extra_info = %s, source = 'scraped'
-                            WHERE movie_id = %s AND quality = %s AND server_name = %s
-                        """, (srv_url, file_size, languages, ep_str,
-                               movie_id, quality, srv_name))
+                                source = 'scraped'
+                            WHERE movie_id = %s AND quality = %s AND server_name = %s AND extra_info = %s
+                        """, (srv_url, file_size, languages,
+                               movie_id, quality, srv_name, ep_str))
                     else:
                         cur.execute("""
                             INSERT INTO movie_files

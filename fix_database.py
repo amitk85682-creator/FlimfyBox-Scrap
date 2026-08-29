@@ -95,13 +95,19 @@ def parse_episode_from_text(text):
 
 
 def parse_quality_from_text(text):
-    """'EPiSODE 1 480p WEB-DL' → '480p WEB-DL'"""
-    if not text:
-        return ""
+    """'EPiSODE 1 480p WEB-DL' → '480p'"""
+    if not text: return ''
     m = QUALITY_PATTERN.search(text)
     if m:
-        return text[m.start():m.start()+40].strip()
-    return ""
+        # Pura 40 chars lene se URL extension (mkv) aa jata hai
+        # Sirf quality format aur next word agar clean hai toh lete hain
+        q_base = m.group(1)
+        tail = text[m.end():m.end()+15].strip()
+        tail_word = re.split(r'[^a-zA-Z0-9-]', tail)[0]
+        if tail_word.upper() in ('HEVC', 'WEB-DL', '10BIT', 'BLURAY', 'HDRIP'):
+            return f"{q_base} {tail_word}"
+        return q_base
+    return ''
 
 
 def parse_lang_from_url(url):
@@ -190,11 +196,18 @@ def fix_movie_files(conn, dry_run=False, movie_id_filter=None):
             if new_file_size  != (file_size  or ""): print(f"    file_size:  '{file_size}' → '{new_file_size}'")
 
             if not dry_run:
-                cur.execute("""
-                    UPDATE movie_files
-                    SET quality = %s, extra_info = %s, languages = %s, file_size = %s
-                    WHERE id = %s
-                """, (new_quality, new_extra_info, new_languages, new_file_size, fid))
+                try:
+                    cur.execute("""
+                        UPDATE movie_files
+                        SET quality = %s, extra_info = %s, languages = %s, file_size = %s
+                        WHERE id = %s
+                    """, (new_quality, new_extra_info, new_languages, new_file_size, fid))
+                except psycopg2.errors.UniqueViolation:
+                    conn.rollback()
+                    # Agar duplicate aata hai, purana record delete kar do kyunki naya aa chuka hai
+                    cur.execute("DELETE FROM movie_files WHERE id = %s", (fid,))
+                    conn.commit()
+                    print(f"    ⚠️ Duplicate conflict! Deleted old record id={fid}.")
 
     if not dry_run:
         conn.commit()
@@ -376,6 +389,30 @@ def fix_movies_metadata(conn, dry_run=False, movie_id_filter=None):
 
 
 # =====================================================================
+# PART 0.5 — FIX SCHEMA (Unique constraint for TV Shows)
+# =====================================================================
+def update_db_schema_for_episodes(conn, dry_run=False):
+    """
+    Purana constraint (movie_id, quality, server_name) tha.
+    Agar TV show hai aur quality="480p" set ho gayi (E01, E02 ke liye),
+    toh duplicate error aayega. Isliye constraint mein extra_info add karna hai.
+    """
+    if dry_run:
+        return
+    cur = conn.cursor()
+    try:
+        cur.execute("ALTER TABLE movie_files DROP CONSTRAINT IF EXISTS unique_movie_quality_server;")
+        cur.execute("ALTER TABLE movie_files ADD CONSTRAINT unique_movie_quality_server UNIQUE (movie_id, quality, server_name, extra_info);")
+        conn.commit()
+        print("✅ DB Schema updated to allow multiple episodes per quality!")
+    except Exception as e:
+        conn.rollback()
+        print(f"⚠️ Could not update schema (might already be fixed): {e}")
+    finally:
+        cur.close()
+
+
+# =====================================================================
 # PART 0 — server_name cleanup
 # "Download [Buzz Server]" → "Buzz Server"
 # =====================================================================
@@ -426,6 +463,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
+        update_db_schema_for_episodes(conn, dry_run=args.dry_run)
         clean_server_names(conn, dry_run=args.dry_run)
         if not args.skip_files:
             fix_movie_files(conn, dry_run=args.dry_run, movie_id_filter=args.movie_id)
