@@ -441,15 +441,48 @@ async def process_single_link(browser, sem, raw_link_data):
 # =====================================================================
 # DATA EXTRACTION & TMDB
 # =====================================================================
-def fix_movie_details(scraped_data):
+def fix_movie_details(scraped_data, movie_url=None):
     site_clean_title = scraped_data.get('Site_Clean_Title', '')
     fixed_title = re.sub(r'\(.*?\)', '', site_clean_title) 
     fixed_title = re.sub(r'\[.*?\]', '', fixed_title)      
     search_query = fixed_title.strip()
 
-    if not search_query:
-        raw_t = scraped_data.get('Raw_Title', '').replace('', '').strip()
-        search_query = re.split(r'\(|\[', raw_t)[0].strip()
+    if not search_query or search_query == 'N/A':
+        raw_t = scraped_data.get('Raw_Title', '').replace('', '').strip()
+        if raw_t and raw_t != 'N/A':
+            search_query = re.split(r'\(|\[', raw_t)[0].strip()
+    
+    # ULTIMATE FALLBACK: Extract title from URL slug
+    # e.g. "thor-ragnarok-2017-hindi-dual-audio-720p" → "thor ragnarok"
+    if (not search_query or search_query == 'N/A') and movie_url:
+        try:
+            slug = movie_url.rstrip('/').split('/')[-1]  # "thor-ragnarok-2017-hindi-dual-audio-720p-hdrip-esubs-1gb"
+            # Remove common junk words from slug
+            junk_words = ['hindi', 'english', 'dual', 'audio', 'dubbed', 'uncut', 'hdrip', 'webrip', 
+                         'bluray', 'web', 'dl', 'esubs', 'esub', '480p', '720p', '1080p', '4k',
+                         'x264', 'x265', 'hevc', 'aac', 'mb', 'gb', 'full', 'movie', 'hd',
+                         'pre', 'dvdrip', 'brrip', 'hdtc', 'camrip', 'south', 'bollywood',
+                         'hollywood', 'series', 'season', 'complete', 'all', 'episodes']
+            parts = slug.split('-')
+            clean_parts = []
+            for p in parts:
+                # Stop at year (4 digits)
+                if re.match(r'^\d{4}$', p):
+                    break
+                # Stop at file size (300mb, 1gb, etc)
+                if re.match(r'^\d+[mg]b?$', p, re.IGNORECASE):
+                    break
+                if p.lower() not in junk_words and len(p) > 1:
+                    clean_parts.append(p)
+            search_query = ' '.join(clean_parts).strip()
+            if search_query:
+                print(f"   🔗 Title extracted from URL: '{search_query}'", flush=True)
+        except:
+            pass
+    
+    if not search_query or search_query == 'N/A':
+        search_query = 'UNKNOWN_TITLE'
+    
     scraped_data['Search_Query'] = search_query
     return scraped_data
 
@@ -641,7 +674,7 @@ async def scrape_and_save_movie(movie_link, browser, main_context, sem):
             return results;
         }''')
 
-        fixed_data = fix_movie_details(scraped_data)
+        fixed_data = fix_movie_details(scraped_data, movie_url=movie_link)
         tmdb_data = get_tmdb_details(fixed_data)
 
         title_to_check = tmdb_data.get('Title') if tmdb_data else None
