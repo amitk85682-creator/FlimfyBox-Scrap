@@ -406,14 +406,26 @@ def fix_movies_metadata(conn, dry_run=False, movie_id_filter=None):
             print(f"    {k}: '{str(v)[:80]}'")
 
         if not dry_run:
-            set_clause = ', '.join(f'"{k}" = %s' for k in updates)
-            vals = list(updates.values()) + [mid]
-            cur.execute(f"UPDATE movies SET {set_clause} WHERE id = %s", vals)
+            try:
+                set_clause = ', '.join(f'"{k}" = %s' for k in updates)
+                vals = list(updates.values()) + [mid]
+                cur.execute(f"UPDATE movies SET {set_clause} WHERE id = %s", vals)
+                conn.commit()
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                if 'title' in updates:
+                    print(f"    ⚠️ Title duplicate conflict! Retrying without title update.")
+                    del updates['title']
+                    if updates:
+                        set_clause = ', '.join(f'"{k}" = %s' for k in updates)
+                        vals = list(updates.values()) + [mid]
+                        cur.execute(f"UPDATE movies SET {set_clause} WHERE id = %s", vals)
+                        conn.commit()
+                else:
+                    print(f"    ⚠️ Unique conflict. Skipping id={mid}.")
 
         time.sleep(0.3)  # TMDB rate limit
 
-    if not dry_run:
-        conn.commit()
     print(f"\n  ✅ {fixed} movies fixed")
     cur.close()
 
