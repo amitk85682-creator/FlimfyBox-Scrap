@@ -149,8 +149,8 @@ def find_duplicate_movie(scraped_data, tmdb_data):
             print(f"   ✅ DUPLICATE [score={best_score}]: DB='{best_title}' ↔ scraped='{tmdb_title}' | Matched: {', '.join(reasons[:3])}")
             return True, best_id, best_score
         elif best_score >= 2:
-            print(f"   ⚠️  POSSIBLE DUPLICATE [score={best_score}]: DB='{best_title}' ↔ '{tmdb_title}' — treating as same")
-            return True, best_id, best_score
+            print(f"   ⚠️  WEAK MATCH [score={best_score}]: DB='{best_title}' ↔ '{tmdb_title}' — NOT skipping (too risky)")
+            return False, None, best_score
         else:
             return False, None, best_score
 
