@@ -176,14 +176,25 @@ def fix_movie_files(conn, dry_run=False, movie_id_filter=None):
         # 1. Episode info quality column se extra_info mein
         fallback = f"{m_title or ''} {m_url or ''}"
         _, _, ep_str = parse_episode_from_text(quality_orig, fallback)
-        if ep_str and not new_extra_info:
+        
+        # If quality no longer contains episode but extra_info is just 'E03', check fallback for season
+        if not ep_str and new_extra_info and re.match(r'^E\d{1,3}$', new_extra_info, re.I):
+            m_s = re.search(r'(?i)season\s*(\d+)', fallback)
+            if m_s:
+                ep_str = f"S{int(m_s.group(1)):02d}{new_extra_info.upper()}"
+
+        if ep_str and ep_str != new_extra_info:
             new_extra_info = ep_str
+            changed = True
             # quality se episode strip karke asli quality lo
             real_q = parse_quality_from_text(quality_orig)
             if not real_q:
                 real_q = parse_quality_from_text(url_str.split('/')[-1])
-            new_quality = real_q if real_q else "Unknown"
-            changed = True
+            
+            if real_q:
+                new_quality = real_q
+            elif not new_quality or 'episode' in new_quality.lower() or 'ep' in new_quality.lower():
+                new_quality = "Unknown"
 
         # 2. Languages blank → URL se
         if not new_languages or new_languages.lower() in ('n/a', 'unknown', 'none', ''):
