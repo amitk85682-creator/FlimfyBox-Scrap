@@ -606,16 +606,46 @@ async def scrape_and_save_movie(movie_link, browser, main_context, sem):
             let lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
             let details = { Raw_Title: 'N/A', Site_Clean_Title: 'N/A', Year: 'N/A', Type: 'Movie', IMDb: 'N/A', Genre: 'N/A', Stars: 'N/A', Director: 'N/A', Creator: 'N/A', Language: 'N/A', Quality: 'N/A', Description: 'N/A' };
 
-            for (let line of lines) {
-                if (line.includes('')) {
-                    details.Raw_Title = line;
-                    let yearMatch = line.match(/\\((\\d{4})\\)/);
-                    if(yearMatch) details.Year = yearMatch[1];
-                    break;
+            // METHOD 1: Get title from H1 heading tag (most reliable)
+            let h1 = document.querySelector('h1.entry-title, h1.post-title, h1');
+            if (h1) {
+                details.Raw_Title = h1.innerText.trim();
+            }
+            
+            // METHOD 2: If H1 failed, try the line before "imdb rating:"
+            if (details.Raw_Title === 'N/A' || details.Raw_Title.length < 5) {
+                let imdbIdx = lines.findIndex(l => l.toLowerCase().includes('imdb rating:'));
+                if (imdbIdx > 0) {
+                    details.Raw_Title = lines[imdbIdx - 1];
                 }
             }
+            
+            // METHOD 3: If still failed, find any line with a year pattern like (2017)
+            if (details.Raw_Title === 'N/A' || details.Raw_Title.length < 5) {
+                for (let line of lines) {
+                    if (line.match(/\\(\\d{4}\\)/) && line.length > 10 && line.length < 200) {
+                        details.Raw_Title = line;
+                        break;
+                    }
+                }
+            }
+            
+            // Strip private-use Unicode characters (U+E000-U+F8FF range) from Raw_Title
+            details.Raw_Title = details.Raw_Title.replace(/[\\uE000-\\uF8FF]/g, '').trim();
+            
+            // Extract year from title
+            let yearMatch = details.Raw_Title.match(/\\((\\d{4})\\)/);
+            if (yearMatch) details.Year = yearMatch[1];
+            
+            // Site_Clean_Title: line before "imdb rating:"
             let imdbIndex = lines.findIndex(l => l.toLowerCase().includes('imdb rating:'));
-            if (imdbIndex > 0) details.Site_Clean_Title = lines[imdbIndex - 1]; 
+            if (imdbIndex > 0) {
+                details.Site_Clean_Title = lines[imdbIndex - 1].replace(/[\\uE000-\\uF8FF]/g, '').trim();
+            }
+            // If Site_Clean_Title is still N/A, use Raw_Title
+            if (details.Site_Clean_Title === 'N/A' && details.Raw_Title !== 'N/A') {
+                details.Site_Clean_Title = details.Raw_Title;
+            }
 
             let imdbMatch = text.match(/iMDB Rating:\\s*(.*)/i);
             if(imdbMatch) details.IMDb = imdbMatch[1].trim();
