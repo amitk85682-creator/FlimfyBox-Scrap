@@ -762,14 +762,14 @@ async def master_auto_scraper():
             await main_context.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media"] else route.continue_())
             
             page = await main_context.new_page()
-            current_url = "https://new5.hdhub4u.cl/" 
-            page_num = 1
             sem = asyncio.Semaphore(20) 
             print("✅ Browser ready, starting scrape!", flush=True)
 
-            while current_url:
+            page_num = start_page
+            while page_num <= end_page:
+                current_url = f"https://new5.hdhub4u.cl/page/{page_num}/" if page_num > 1 else "https://new5.hdhub4u.cl/"
                 print(f"\n{'='*50}", flush=True)
-                print(f"🌐 Scraping PAGE {page_num}: {current_url}", flush=True)
+                print(f"🌐 Scraping PAGE {page_num} of {end_page}: {current_url}", flush=True)
                 print(f"{'='*50}", flush=True)
                 
                 try:
@@ -777,7 +777,8 @@ async def master_auto_scraper():
                     print(f"✅ Page {page_num} loaded, extracting movie links...", flush=True)
                 except Exception as e:
                     print(f"❌ Failed to load page {page_num}: {e}", flush=True)
-                    break
+                    page_num += 1
+                    continue
 
                 movies_on_page = await page.evaluate('''() => {
                     let links = Array.from(document.querySelectorAll('a'));
@@ -811,16 +812,16 @@ async def master_auto_scraper():
                     # 2. Process Movie (Skips if already in Postgres DB)
                     await scrape_and_save_movie(movie_link, browser, main_context, sem)
                     
-                next_page_url = await page.evaluate('''() => {
-                    let nextBtn = document.querySelector('a.next.page-numbers');
-                    return nextBtn ? nextBtn.href : null;
-                }''')
-
-                current_url = next_page_url
-                if current_url: page_num += 1
+                page_num += 1
 
     except KeyboardInterrupt:
         print("\n🛑 Process stopped manually.")
 
 if __name__ == "__main__":
-    asyncio.run(master_auto_scraper())
+    import argparse
+    parser = argparse.ArgumentParser(description="Matrix Scraper Bot")
+    parser.add_argument("--start_page", type=int, required=True, help="Start page number")
+    parser.add_argument("--end_page", type=int, required=True, help="End page number")
+    args = parser.parse_args()
+
+    asyncio.run(master_auto_scraper(args.start_page, args.end_page))

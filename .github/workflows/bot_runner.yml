@@ -25,4 +25,5 @@ jobs:
       - name: Run Scraper Bot
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          PYTHONUNBUFFERED: "1"
         run: python scraper.py
