@@ -149,8 +149,8 @@ def find_duplicate_movie(scraped_data, tmdb_data):
             print(f"   ✅ DUPLICATE [score={best_score}]: DB='{best_title}' ↔ scraped='{tmdb_title}' | Matched: {', '.join(reasons[:3])}")
             return True, best_id, best_score
         elif best_score >= 2:
-            print(f"   ⚠️  WEAK MATCH [score={best_score}]: DB='{best_title}' ↔ '{tmdb_title}' — NOT skipping (too risky)")
-            return False, None, best_score
+            print(f"   ⚠️  POSSIBLE DUPLICATE [score={best_score}]: DB='{best_title}' ↔ '{tmdb_title}' — treating as same")
+            return True, best_id, best_score
         else:
             return False, None, best_score
 
@@ -219,6 +219,17 @@ def save_movie_to_db(data_dict):
         
         tmdb = data_dict.get('tmdb_data') or {}
         title  = tmdb.get('Title') or data_dict.get('raw_title')
+        
+        if title:
+            # Clean junk words from title
+            junk_pattern = r'(?i)\b(uncut|hindi|dual\s*audio|dubbed|480p|720p|1080p|hdrip|webrip|web-dl|x264|hevc|esubs?|mb|gb|brrip|dvdrip|hdtc|camrip|x265|aac)\b'
+            title = re.sub(junk_pattern, '', title)
+            # Remove trailing year from title
+            title = re.sub(r'\b(19|20)\d{2}\b', '', title)
+            # Remove hyphens, parentheses, and brackets
+            title = re.sub(r'[\(\)\[\]\-]+', ' ', title)
+            # Strip extra spaces
+            title = re.sub(r'\s+', ' ', title).strip()
         year   = tmdb.get('Release', '')[:4] if tmdb.get('Release') else 'N/A'
         poster = tmdb.get('Poster') or ''
         tmdb_id = str(tmdb.get('tmdb_id', '')) if tmdb.get('tmdb_id') else None
