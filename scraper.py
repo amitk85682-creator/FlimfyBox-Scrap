@@ -506,7 +506,21 @@ def get_tmdb_details(fixed_data):
             for res in results:
                 if res.get('media_type') == type_hint:
                     best_match = res; break
-        if not best_match: best_match = results[0]
+        if not best_match:
+            # Dangerous mismatch (like 1737451) usually happens here when taking a random results[0].
+            import hashlib
+            unique_hash = int(hashlib.md5(search_query.encode()).hexdigest(), 16)
+            fallback_id = (unique_hash % 100000000) + 900000000 
+            return {
+                "Matched_Type": type_hint.upper(),
+                "Orig_Language": target_orig_lang.upper() if target_orig_lang else "UNKNOWN",
+                "Title": search_query,
+                "Release": year_hint,
+                "tmdb_id": fallback_id,
+                "Overview": "N/A",
+                "Poster": None,
+                "is_tv": type_hint == 'tv'
+            }
 
         return {
             "Matched_Type": best_match.get('media_type', 'unknown').upper(),
@@ -527,7 +541,20 @@ def get_tmdb_details(fixed_data):
             ),
             "is_tv": best_match.get('media_type') == 'tv'
         }
-    except: return None
+    except Exception as e:
+        import hashlib
+        unique_hash = int(hashlib.md5(search_query.encode()).hexdigest(), 16)
+        fallback_id = (unique_hash % 100000000) + 900000000 
+        return {
+            "Matched_Type": type_hint.upper(),
+            "Orig_Language": target_orig_lang.upper() if target_orig_lang else "UNKNOWN",
+            "Title": search_query,
+            "Release": year_hint,
+            "tmdb_id": fallback_id,
+            "Overview": "N/A",
+            "Poster": None,
+            "is_tv": type_hint == 'tv'
+        }
 
 # =====================================================================
 # CORE LOGIC: PROCESS A SINGLE MOVIE
