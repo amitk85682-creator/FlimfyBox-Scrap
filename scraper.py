@@ -275,40 +275,113 @@ def save_movie_to_db(data_dict):
         
         if movie_id:
             bypassed_links = data_dict.get('bypassed_links', [])
+            
+            # ── Helpers for correct DB columns ──────────────────────────────
+            _EP_RE  = re.compile(r'(?i)(?:s(\d{1,2})\s*e(\d{1,3})|season\s*(\d+)\s*(?:episode|ep)?\s*(\d+)|(?:episode|ep|epi)\s*(\d+))')
+            _Q_RE   = re.compile(r'(?i)\b(4k|2160p|1080p|720p|576p|480p|360p|camrip|hdtc)\b')
+            _SZ_RE  = re.compile(r'(?i)(\d+(?:\.\d+)?\s*(?:gb|mb))')
+            _SRV_RE = re.compile(r'(?i)download\s*\[(.+?)\]')
+            _LANG_MAP = {
+                'dual':'Hindi-English','multi':'Multi','hindi':'Hindi',
+                'english':'English','tamil':'Tamil','telugu':'Telugu',
+                'malayalam':'Malayalam','kannada':'Kannada','punjabi':'Punjabi',
+                'marathi':'Marathi','bengali':'Bengali',
+            }
+
+            def _parse_episode(text):
+                """Returns (extra_info_str) like 'S04E01' or '' if none."""
+                if not text: return ''
+                m = re.search(r'(?i)s(\d{1,2})\s*e(\d{1,3})', text)
+                if m: return f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}"
+                m = re.search(r'(?i)season\s*(\d+)\s*(?:episode|ep)?\s*(\d+)', text)
+                if m: return f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}"
+                m = re.search(r'(?i)(?:episode|ep|epi)\s*(\d+)', text)
+                if m: return f"E{int(m.group(1)):02d}"
+                return ''
+
+            def _parse_quality(text):
+                """'EPiSODE 1 480p WEB-DL' → '480p WEB-DL', '' if none."""
+                if not text: return ''
+                m = _Q_RE.search(text)
+                return text[m.start():m.start()+30].strip() if m else ''
+
+            def _parse_lang(url):
+                if not url: return ''
+                u = url.lower()
+                if 'dual' in u: return 'Hindi-English'
+                if 'multi' in u: return 'Multi'
+                found = []
+                for kw, nm in _LANG_MAP.items():
+                    if kw in u and nm not in found: found.append(nm)
+                return '-'.join(found)
+
+            def _parse_size(url):
+                if not url: return ''
+                m = _SZ_RE.search(url)
+                return m.group(1).strip().upper().replace(' ','') if m else ''
+
+            def _clean_server_name(raw):
+                m = _SRV_RE.search(raw or '')
+                return m.group(1).strip() if m else (raw or '').strip()
+            # ────────────────────────────────────────────────────────────────
+
             for link in bypassed_links:
-                base_q_name = link.get('quality', 'Unknown')
+                raw_q  = link.get('quality', 'Unknown')
                 f_size = link.get('size', '')
                 direct_links_data = link.get('direct_link')
-                
-                def upsert_file(quality, server_name, srv_url, file_size):
-                    """Insert or update a movie_file row with clean server_name column."""
+
+                def upsert_file(raw_quality, server_name_raw, srv_url, file_size):
+                    """Insert/update movie_file with correctly parsed columns."""
+                    # Parse episode → extra_info
+                    ep_str   = _parse_episode(raw_quality)
+                    # Parse real quality (480p etc.)
+                    real_q   = _parse_quality(raw_quality)
+                    if not real_q:
+                        real_q = _parse_quality(srv_url.split('/')[-1]) if srv_url else ''
+                    quality  = real_q if real_q else raw_quality
+
+                    # Language from URL
+                    languages = _parse_lang(srv_url)
+
+                    # Size from URL if not provided by scraper
+                    if not file_size or file_size.lower() in ('', 'n/a', 'unknown'):
+                        file_size = _parse_size(srv_url)
+
+                    # Clean server_name 'Download [Buzz Server]' → 'Buzz Server'
+                    srv_name = _clean_server_name(server_name_raw)
+
                     cur.execute(
                         "SELECT id FROM movie_files WHERE movie_id = %s AND quality = %s AND server_name = %s",
-                        (movie_id, quality, server_name)
+                        (movie_id, quality, srv_name)
                     )
                     if cur.fetchone():
-                        cur.execute(
-                            "UPDATE movie_files SET url = %s, file_size = %s, source = 'scraped' WHERE movie_id = %s AND quality = %s AND server_name = %s",
-                            (srv_url, file_size, movie_id, quality, server_name)
-                        )
+                        cur.execute("""
+                            UPDATE movie_files
+                            SET url = %s, file_size = %s, languages = %s,
+                                extra_info = %s, source = 'scraped'
+                            WHERE movie_id = %s AND quality = %s AND server_name = %s
+                        """, (srv_url, file_size, languages, ep_str,
+                               movie_id, quality, srv_name))
                     else:
-                        cur.execute(
-                            "INSERT INTO movie_files (movie_id, quality, server_name, url, file_size, source) VALUES (%s, %s, %s, %s, %s, 'scraped')",
-                            (movie_id, quality, server_name, srv_url, file_size)
-                        )
+                        cur.execute("""
+                            INSERT INTO movie_files
+                                (movie_id, quality, server_name, url, file_size,
+                                 languages, extra_info, source)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, 'scraped')
+                        """, (movie_id, quality, srv_name, srv_url,
+                               file_size, languages, ep_str))
 
                 if isinstance(direct_links_data, list):
                     for srv in direct_links_data:
-                        srv_name = srv.get('server_name', '').strip()
-                        srv_url  = srv.get('url', '').strip()
+                        srv_url = srv.get('url', '').strip()
                         if srv_url:
-                            upsert_file(base_q_name, srv_name, srv_url, f_size)
+                            upsert_file(raw_q, srv.get('server_name', ''), srv_url, f_size)
                 elif isinstance(direct_links_data, dict):
                     srv_url = direct_links_data.get('url', '').strip()
                     if srv_url:
-                        upsert_file(base_q_name, '', srv_url, f_size)
+                        upsert_file(raw_q, '', srv_url, f_size)
                 elif isinstance(direct_links_data, str) and direct_links_data.strip():
-                    upsert_file(base_q_name, '', direct_links_data.strip(), f_size)
+                    upsert_file(raw_q, '', direct_links_data.strip(), f_size)
         
         conn.commit()
         cur.close()

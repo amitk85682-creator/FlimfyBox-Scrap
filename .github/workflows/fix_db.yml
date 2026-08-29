@@ -1,0 +1,77 @@
+name: Fix Database Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run? (true = sirf print, DB change nahi)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      movie_id:
+        description: 'Specific movie_id fix karna ho to daalo (blank = ALL)'
+        required: false
+        default: ''
+      skip_files:
+        description: 'movie_files step skip karo?'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      skip_movies:
+        description: 'movies metadata step skip karo?'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  fix-db:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install psycopg2-binary requests
+
+      - name: Run Database Fixer
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          ARGS=""
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+
+          if [ -n "${{ github.event.inputs.movie_id }}" ]; then
+            ARGS="$ARGS --movie-id ${{ github.event.inputs.movie_id }}"
+          fi
+
+          if [ "${{ github.event.inputs.skip_files }}" = "true" ]; then
+            ARGS="$ARGS --skip-files"
+          fi
+
+          if [ "${{ github.event.inputs.skip_movies }}" = "true" ]; then
+            ARGS="$ARGS --skip-movies"
+          fi
+
+          echo "Running: python fix_database.py $ARGS"
+          python fix_database.py $ARGS
