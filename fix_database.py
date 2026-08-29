@@ -257,6 +257,27 @@ LANG_CODE_MAP = {
 }
 
 
+def clean_title_for_db(raw_title):
+    if not raw_title or raw_title in ('N/A', 'Unknown', ''):
+        return raw_title
+        
+    t = raw_title
+    # Remove everything after a pipe |
+    t = t.split('|')[0]
+    
+    # Remove common junk words
+    junk = r'(?i)\b(uncut|hindi|english|dual\s*audio|dubbed|4k|2160p|1080p|720p|480p|360p|hdrip|webrip|web-dl|web|dl|x264|x265|hevc|esubs?|mb|gb|brrip|dvdrip|hdtc|camrip|aac|dd2\.0|dd5\.1|nf\s*series|full\s*movie|movies?)\b'
+    t = re.sub(junk, ' ', t)
+    
+    # Remove year if present
+    t = re.sub(r'\b(19|20)\d{2}\b', ' ', t)
+    
+    # Remove brackets, hyphens, and ampersands
+    t = re.sub(r'[\(\)\[\]\-&]+', ' ', t)
+    
+    return re.sub(r'\s+', ' ', t).strip()
+
+
 def fix_movies_metadata(conn, dry_run=False, movie_id_filter=None):
     cur = conn.cursor()
 
@@ -297,9 +318,11 @@ def fix_movies_metadata(conn, dry_run=False, movie_id_filter=None):
                 tmdb_details = tmdb_get_details(imdb_id, is_tv=True)
                 is_tv = bool(tmdb_details.get('id'))
         elif title and title not in ('N/A', 'Unknown', ''):
-            res = tmdb_search(title, year=year, is_tv=False)
+            clean_t = clean_title_for_db(title)
+            print(f"    🔍 Searching TMDB for: '{clean_t}'")
+            res = tmdb_search(clean_t, year=year, is_tv=False)
             if not res:
-                res = tmdb_search(title, year=year, is_tv=True)
+                res = tmdb_search(clean_t, year=year, is_tv=True)
                 is_tv = True if res else False
             if res:
                 tmdb_details = tmdb_get_details(res.get('id'), is_tv=is_tv)
@@ -356,7 +379,14 @@ def fix_movies_metadata(conn, dry_run=False, movie_id_filter=None):
             return not v or str(v).strip() in ('', 'N/A', 'Unknown', 'None')
 
         updates = {}
-        if stale(genre)       and new_genre:        updates['genre']       = new_genre
+        # Agar title clean karne se badla hai, toh DB mein save karo (original title update TMDB se na karke clean wala use karte hain)
+        clean_title = clean_title_for_db(title)
+        if title != clean_title and clean_title:
+            # Maybe TMDB has a better title, but we can trust clean_title first
+            better_title = tmdb_details.get('title') or tmdb_details.get('name') or clean_title
+            updates['title'] = better_title
+
+        if stale(genre)       and new_genre:         updates['genre']       = new_genre
         if stale(rating)      and new_rating:        updates['rating']      = new_rating
         if stale(description) and new_description:   updates['description'] = new_description[:1500]
         if stale(cast)        and new_cast:          updates['cast']        = new_cast
@@ -364,7 +394,7 @@ def fix_movies_metadata(conn, dry_run=False, movie_id_filter=None):
         if stale(category)    and new_category:      updates['category']    = new_category
         if stale(language)    and new_language:      updates['language']    = new_language
         if new_poster:                               updates['poster_url']  = new_poster
-        if stale(imdb_id)     and new_tmdb_id:      updates['imdb_id']     = new_tmdb_id
+        if stale(imdb_id)     and new_tmdb_id:       updates['imdb_id']     = new_tmdb_id
         if new_year and new_year != year:            updates['year']        = new_year
 
         if not updates:
