@@ -15,8 +15,8 @@ nest_asyncio.apply()
 # =====================================================================
 # DIRECT POSTGRESQL DATABASE CONFIGURATION
 # =====================================================================
-# Hardcoded to prevent GitHub Secrets from overriding it with the old DB URL
 DATABASE_URL = "postgresql://postgres.vzixjxeppvpxrhntaidb:l0aDck2NUeD4Jws5@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"
+TMDB_KEY = "9fa44f5e9fbd41415df930ce5b81c4d7"
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, connect_timeout=10)
@@ -34,301 +34,241 @@ def check_movie_in_db(url):
         print(f"DB Check Error: {e}")
         return False
 
-def find_duplicate_movie(scraped_data, tmdb_data):
-    """
-    Multi-field scoring se duplicate check karo.
-    
-    Fields compared:
-      ✅ Title (base + full + bidirectional)  → 3 pts
-      ✅ Year                                  → 2 pts  
-      ✅ Stars / Cast                          → 2 pts
-      ✅ Director                              → 2 pts
-      ✅ Creator (TV Series)                   → 2 pts
+# =====================================================================
+# 1. FIX MOVIE DETAILS (Extract Title, Year, Type from Bracket)
+# =====================================================================
+def fix_movie_details(scraped_data, movie_url=None):
+    raw_title = scraped_data.get('Raw_Title', '').replace('🎬', '').strip()
+    search_query = 'UNKNOWN_TITLE'
+    year = 'N/A'
+    media_type = 'Movie'
+    default_season = 1  
 
-    Score >= 4  → Confident duplicate (return movie_id)
-    Score 2-3   → Possible duplicate (log warning, return movie_id)
-    Score < 2   → Not a duplicate (return None)
+    if raw_title and raw_title != 'N/A':
+        title_parts = re.split(r'\(|\[', raw_title)
+        search_query = title_parts[0].strip()
 
-    Returns: (found: bool, movie_id: int or None, score: int)
-    """
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # --- Prepare scraped fields ---
-        tmdb_title   = (tmdb_data or {}).get('Title', '') or ''
-        base_title   = tmdb_title.split(':')[0].strip()  # "Toxic: A Fairytale..." → "Toxic"
-        year_val     = (tmdb_data or {}).get('Release', '')[:4] if (tmdb_data or {}).get('Release') else ''
-        stars_raw    = scraped_data.get('Stars', '') or ''
-        director_raw = scraped_data.get('Director', '') or ''
-        creator_raw  = scraped_data.get('Creator', '') or ''
-
-        # Normalize to lowercase word sets
-        def word_set(s):
-            return set(w.strip().lower() for w in s.replace(',', ' ').split() if len(w.strip()) > 2)
-
-        scraped_stars    = word_set(stars_raw)
-        scraped_director = word_set(director_raw)
-        scraped_creator  = word_set(creator_raw)
-
-        # --- Step 1: Get title candidates from DB ---
-        cur.execute("""
-            SELECT id, title, year, "cast", rating, language
-            FROM movies
-            WHERE 
-                title ILIKE %s OR
-                title ILIKE %s OR
-                %s ILIKE concat('%%', title, '%%') OR
-                %s ILIKE concat('%%', title, '%%')
-            LIMIT 10;
-        """, (
-            f"%{tmdb_title}%",
-            f"%{base_title}%",
-            tmdb_title,
-            base_title
-        ))
-        candidates = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        if not candidates:
-            return False, None, 0
-
-        best_score = 0
-        best_id    = None
-        best_title = None
-
-        for (db_id, db_title, db_year, db_cast, db_rating, db_lang) in candidates:
-            score = 0
-            reasons = []
-
-            # --- Title score (max 3 pts) ---
-            db_title_lower   = (db_title or '').lower()
-            tmdb_title_lower = tmdb_title.lower()
-            base_title_lower = base_title.lower()
-
-            if db_title_lower == tmdb_title_lower:
-                score += 3; reasons.append("exact title")
-            elif base_title_lower and (base_title_lower == db_title_lower or
-                 base_title_lower in db_title_lower or
-                 db_title_lower in base_title_lower):
-                score += 2; reasons.append("base title match")
-            elif tmdb_title_lower in db_title_lower or db_title_lower in tmdb_title_lower:
-                score += 1; reasons.append("partial title")
-
-            # --- Year score (2 pts) ---
-            if year_val and db_year and str(db_year) == str(year_val):
-                score += 2; reasons.append(f"year={year_val}")
-
-            # --- Stars/Cast score (2 pts) ---
-            db_cast_set = word_set(db_cast or '')
-            if scraped_stars and db_cast_set:
-                common = scraped_stars & db_cast_set
-                if len(common) >= 2:
-                    score += 2; reasons.append(f"stars={common}")
-                elif len(common) == 1:
-                    score += 1; reasons.append(f"1 star={common}")
-
-            # --- Director score (2 pts) ---
-            # DB doesn't have director column separately, skip if not available
-            # (future: add director column to movies table)
-
-            # --- Creator score (2 pts) ---
-            db_cast_words = word_set(db_cast or '')
-            if scraped_creator and db_cast_words:
-                if scraped_creator & db_cast_words:
-                    score += 1; reasons.append("creator overlap")
-
-            if score > best_score:
-                best_score = score
-                best_id    = db_id
-                best_title = db_title
-
-        # --- Decision ---
-        if best_score >= 4:
-            print(f"   ✅ DUPLICATE [score={best_score}]: DB='{best_title}' ↔ scraped='{tmdb_title}' | Matched: {', '.join(reasons[:3])}")
-            return True, best_id, best_score
-        elif best_score >= 2:
-            print(f"   ⚠️  POSSIBLE DUPLICATE [score={best_score}]: DB='{best_title}' ↔ '{tmdb_title}' — treating as same")
-            return True, best_id, best_score
-        else:
-            return False, None, best_score
-
-    except Exception as e:
-        print(f"Duplicate Check Error: {e}")
-        return False, None, 0
-
-
-def check_movie_by_tmdb_id(tmdb_id):
-    """
-    TMDB ID se exact duplicate check — title matching se zyada reliable.
-    Returns: (exists: bool, movie_id: int or None)
-    """
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT id, title FROM movies WHERE imdb_id = %s LIMIT 1;", (str(tmdb_id),))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        if row:
-            return True, row[0]
-        return False, None
-    except Exception as e:
-        print(f"DB TMDB ID Check Error: {e}")
-        return False, None
-
-def get_existing_seasons_episodes(title):
-    """
-    TV Series ke liye: DB mein kaun se seasons/episodes already hain?
-    Returns: dict like {"Season 1": ["Ep01", "Ep02"], "Season 2": []} 
-             ya phir empty dict agar kuch nahi mila.
-    """
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        # movie_id dhundo title se
-        cur.execute("SELECT id FROM movies WHERE title ILIKE %s LIMIT 1;", (f"%{title}%",))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            conn.close()
-            return {}
-        movie_id = row[0]
-        # Existing qualities fetch karo (ye season/episode info contain karti hain)
-        cur.execute(
-            "SELECT quality, server_name FROM movie_files WHERE movie_id = %s ORDER BY quality;",
-            (movie_id,)
-        )
-        files = cur.fetchall()
-        cur.close()
-        conn.close()
+        brackets_content = re.findall(r'\((.*?)\)|\[(.*?)\]', raw_title)
+        bracket_texts = [item for sublist in brackets_content for item in sublist if item]
         
-        existing = {}
-        for (quality, server_name) in files:
-            existing.setdefault(quality, []).append(server_name or '')
-        return existing
-    except Exception as e:
-        print(f"DB Season Check Error: {e}")
-        return {}
+        for text in bracket_texts:
+            text_lower = text.lower().strip()
+            if re.match(r'^\d{4}$', text_lower):
+                year = text_lower
+            elif "season" in text_lower or re.match(r'^s\d+', text_lower):
+                media_type = 'TV Series'
 
+        s_match = re.search(r'(?i)\bseason\s*(\d+)', raw_title)
+        if s_match:
+            media_type = 'TV Series'
+            default_season = int(s_match.group(1))
+            search_query = re.sub(r'(?i)\bseason\s*\d+.*', '', search_query).strip()
+        elif re.search(r'(?i)\bepisode\b', raw_title):
+            media_type = 'TV Series'
+
+    if not search_query or search_query == 'UNKNOWN_TITLE':
+        if movie_url:
+            try:
+                slug = movie_url.rstrip('/').split('/')[-1]
+                if 'season' in slug.lower() or 'episode' in slug.lower():
+                    media_type = 'TV Series'
+                
+                s_match_url = re.search(r'(?i)season-(\d+)', slug)
+                if s_match_url:
+                    default_season = int(s_match_url.group(1))
+
+                junk_words = ['hindi', 'english', 'dual', 'audio', 'dubbed', 'uncut', 'hdrip', 'webrip', 
+                              'bluray', 'web', 'dl', 'esubs', 'esub', '480p', '720p', '1080p', '4k',
+                              'x264', 'x265', 'hevc', 'aac', 'mb', 'gb', 'full', 'movie', 'hd',
+                              'pre', 'dvdrip', 'brrip', 'hdtc', 'camrip', 'south', 'bollywood',
+                              'hollywood', 'series', 'season', 'complete', 'all', 'episodes']
+                parts = slug.split('-')
+                clean_parts = []
+                for p in parts:
+                    if re.match(r'^\d{4}$', p):
+                        year = p
+                        break
+                    if re.match(r'^\d+[mg]b?$', p, re.IGNORECASE):
+                        break
+                    if p.lower() not in junk_words and len(p) > 1:
+                        clean_parts.append(p)
+                search_query = ' '.join(clean_parts).strip()
+            except:
+                pass
+
+    if not search_query:
+        search_query = 'UNKNOWN_TITLE'
+
+    scraped_data['Search_Query'] = search_query
+    scraped_data['Year'] = year
+    scraped_data['Type'] = media_type
+    scraped_data['Default_Season'] = default_season  
+    
+    print(f"   ✅ Cleaned Title: '{search_query}' | Season: {default_season} | Type: '{media_type}'", flush=True)
+    return scraped_data
+
+# =====================================================================
+# 2. TMDB DETAILS (Strict API Call: TV for Series, Movie for Movie)
+# =====================================================================
+def get_tmdb_details(fixed_data):
+    search_query = fixed_data['Search_Query']
+    year_hint = fixed_data['Year']
+    type_hint = 'tv' if fixed_data['Type'] == 'TV Series' else 'movie'
+
+    print(f"   🌐 Fetching LIVE data from TMDB for: {search_query} (Type: {type_hint})...", flush=True)
+    
+    if type_hint == 'tv':
+        url = f"https://api.themoviedb.org/3/search/tv?api_key={TMDB_KEY}&query={urllib.parse.quote(search_query)}"
+    else:
+        url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_KEY}&query={urllib.parse.quote(search_query)}"
+        
+    try:
+        response = requests.get(url, timeout=10).json()
+        results = response.get('results', [])
+        
+        if not results:
+            return None
+
+        best_match = results[0]
+        tmdb_id = best_match.get('id')
+        
+        details_url = f"https://api.themoviedb.org/3/{type_hint}/{tmdb_id}?api_key={TMDB_KEY}"
+        details = requests.get(details_url, timeout=10).json()
+        
+        genres = [g['name'] for g in details.get('genres', [])]
+        genre_str = ", ".join(genres) if genres else "N/A"
+        plot = details.get('overview', 'N/A')
+        rating = str(round(details.get('vote_average', 0), 1)) if details.get('vote_average') else 'N/A'
+        
+        credits_url = f"https://api.themoviedb.org/3/{type_hint}/{tmdb_id}/credits?api_key={TMDB_KEY}"
+        credits = requests.get(credits_url, timeout=10).json()
+        cast_list = [c['name'] for c in credits.get('cast', [])[:5]]
+        cast_str = ", ".join(cast_list) if cast_list else "N/A"
+        
+        ext_url = f"https://api.themoviedb.org/3/{type_hint}/{tmdb_id}/external_ids?api_key={TMDB_KEY}"
+        ext_ids = requests.get(ext_url, timeout=10).json()
+        imdb_id = ext_ids.get('imdb_id', 'N/A')
+        
+        seasons_data = {}
+        if type_hint == 'tv':
+            for s in details.get('seasons', []):
+                s_num = str(s.get('season_number', ''))
+                if s_num and s_num != "0":
+                    s_air_date = str(s.get('air_date', ''))
+                    s_year = int(s_air_date[:4]) if len(s_air_date) >= 4 and s_air_date[:4].isdigit() else 0
+                    s_poster = f"https://image.tmdb.org/t/p/original{s.get('poster_path')}" if s.get('poster_path') else None
+                    
+                    episodes_info = {}
+                    try:
+                        season_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{s_num}?api_key={TMDB_KEY}"
+                        season_details = requests.get(season_url, timeout=5).json()
+                        for ep in season_details.get('episodes', []):
+                            ep_num = str(ep.get('episode_number'))
+                            episodes_info[ep_num] = {'air_date': ep.get('air_date', '')}
+                    except:
+                        pass
+                        
+                    seasons_data[s_num] = {
+                        "year": s_year,
+                        "poster": s_poster,
+                        "air_date": s_air_date,
+                        "episode_count": s.get('episode_count', 0),
+                        "episodes": episodes_info
+                    }
+                    
+        return {
+            "Title": best_match.get('name') or best_match.get('title'),
+            "Release": best_match.get('first_air_date') or best_match.get('release_date', 'N/A'),
+            "tmdb_id": tmdb_id,
+            "imdb_id": imdb_id,
+            "Genre": genre_str,
+            "Description": plot,
+            "TMDb_Rating": rating,
+            "Cast": cast_str,
+            "seasons_data": seasons_data,
+            "Poster": f"https://image.tmdb.org/t/p/original{best_match.get('poster_path')}" if best_match.get('poster_path') else 'N/A',
+            "is_tv": type_hint == 'tv'
+        }
+    except Exception as e:
+        print(f"TMDB Deep Fetch Error: {e}")
+        return None
+
+# =====================================================================
+# 3. SAVE TO DB (PAGE DATA PRIORITY + URL DECODING FOR FILES)
+# =====================================================================
 def save_movie_to_db(data_dict):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
         tmdb = data_dict.get('tmdb_data') or {}
-        title  = tmdb.get('Title') or data_dict.get('raw_title')
+        title  = tmdb.get('Title') or data_dict.get('clean_title')
         
         if title:
-            # Clean junk words from title
             junk_pattern = r'(?i)\b(uncut|hindi|dual\s*audio|dubbed|480p|720p|1080p|hdrip|webrip|web-dl|x264|hevc|esubs?|mb|gb|brrip|dvdrip|hdtc|camrip|x265|aac)\b'
             title = re.sub(junk_pattern, '', title)
-            # Remove trailing year from title
             title = re.sub(r'\b(19|20)\d{2}\b', '', title)
-            # Remove hyphens, parentheses, and brackets
-            title = re.sub(r'[\(\)\[\]\-]+', ' ', title)
-            # Strip extra spaces
-            title = re.sub(r'\s+', ' ', title).strip()
+            title = re.sub(r'[\(\)\[\]\-]+', ' ', title).strip()
+
         year   = tmdb.get('Release', '')[:4] if tmdb.get('Release') else 'N/A'
         poster = tmdb.get('Poster') or ''
         tmdb_id = str(tmdb.get('tmdb_id', '')) if tmdb.get('tmdb_id') else None
         
-        try:
-            year_val = int(year)
-        except:
-            year_val = None
+        page_genre = data_dict.get('Genre', 'N/A')
+        page_rating = data_dict.get('imdb', 'N/A')
+        page_cast = data_dict.get('Stars', 'N/A')
+        page_lang = data_dict.get('Language', 'N/A')
+        page_desc = data_dict.get('description', 'N/A')
+
+        genre_str  = page_genre if page_genre != 'N/A' else tmdb.get('Genre', 'N/A')
+        rating_str = page_rating if page_rating != 'N/A' else tmdb.get('TMDb_Rating', 'N/A')
+        cast_str   = page_cast if page_cast != 'N/A' else tmdb.get('Cast', 'N/A')
+        plot_str   = page_desc if page_desc != 'N/A' else tmdb.get('Description', 'N/A')
+        lang_str   = page_lang if page_lang != 'N/A' else 'Hindi'
         
-        # TMDB ID se dhundho pehle (most reliable), phir title se
+        imdb_id_real = tmdb.get('imdb_id')
+        seasons_json = tmdb.get('seasons_data', {})
+        
+        final_category = "Web Series" if data_dict.get('Type') == 'TV Series' or tmdb.get('is_tv') else "Movies"
+        
+        try: year_val = int(year)
+        except: year_val = None
+        
         if tmdb_id:
             cur.execute("SELECT id FROM movies WHERE imdb_id = %s LIMIT 1", (tmdb_id,))
         else:
             cur.execute("SELECT id FROM movies WHERE title = %s LIMIT 1", (title,))
         row = cur.fetchone()
 
+        import json
         if row:
             movie_id = row[0]
             cur.execute("""
                 UPDATE movies SET 
                     url = %s, poster_url = %s, year = %s, genre = %s, 
                     description = %s, rating = %s, language = %s, "cast" = %s,
-                    imdb_id = COALESCE(imdb_id, %s)
+                    imdb_id = %s, seasons_data = %s, category = %s
                 WHERE id = %s
             """, (
-                data_dict['url'], poster, year_val, data_dict.get('Genre', 'N/A'),
-                data_dict.get('Description', 'N/A'), data_dict.get('IMDb', 'N/A'),
-                data_dict.get('Language', 'N/A'), data_dict.get('Stars', 'N/A'),
-                tmdb_id, movie_id
+                data_dict['url'], poster, year_val, genre_str,
+                plot_str, rating_str, lang_str, cast_str,
+                imdb_id_real, json.dumps(seasons_json), final_category, movie_id
             ))
         else:
             cur.execute("""
-                INSERT INTO movies (url, title, poster_url, year, genre, description, rating, language, "cast", imdb_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO movies (url, title, poster_url, year, genre, description, rating, language, "cast", imdb_id, seasons_data, category)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id;
             """, (
                 data_dict['url'], title, poster, year_val,
-                data_dict.get('Genre', 'N/A'), data_dict.get('Description', 'N/A'),
-                data_dict.get('IMDb', 'N/A'), data_dict.get('Language', 'N/A'),
-                data_dict.get('Stars', 'N/A'), tmdb_id
+                genre_str, plot_str, rating_str, lang_str,
+                cast_str, imdb_id_real, json.dumps(seasons_json), final_category
             ))
             movie_id = cur.fetchone()[0]
         
         if movie_id:
             bypassed_links = data_dict.get('bypassed_links', [])
-            
-            # ── Helpers for correct DB columns ──────────────────────────────
-            _EP_RE  = re.compile(r'(?i)(?:s(\d{1,2})\s*e(\d{1,3})|season\s*(\d+)\s*(?:episode|ep)?\s*(\d+)|(?:episode|ep|epi)\s*(\d+))')
-            _Q_RE   = re.compile(r'(?i)\b(4k|2160p|1080p|720p|576p|480p|360p|camrip|hdtc)\b')
-            _SZ_RE  = re.compile(r'(?i)(\d+(?:\.\d+)?\s*(?:gb|mb))')
-            _SRV_RE = re.compile(r'(?i)download\s*\[(.+?)\]')
-            _LANG_MAP = {
-                'dual':'Hindi-English','multi':'Multi','hindi':'Hindi',
-                'english':'English','tamil':'Tamil','telugu':'Telugu',
-                'malayalam':'Malayalam','kannada':'Kannada','punjabi':'Punjabi',
-                'marathi':'Marathi','bengali':'Bengali',
-            }
-
-            def _parse_episode(text, fallback_text=''):
-                """Returns (extra_info_str) like 'S04E01' or '' if none."""
-                if not text: return ''
-                m = re.search(r'(?i)s(\d{1,2})\s*e(\d{1,3})', text)
-                if m: return f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}"
-                m = re.search(r'(?i)season\s*(\d+)\s*(?:episode|ep)?\s*(\d+)', text)
-                if m: return f"S{int(m.group(1)):02d}E{int(m.group(2)):02d}"
-                m = re.search(r'(?i)(?:episode|ep|epi)\s*(\d+)', text)
-                if m:
-                    ep_num = int(m.group(1))
-                    if fallback_text:
-                        m_s = re.search(r'(?i)season\s*(\d+)', fallback_text)
-                        if m_s: return f"S{int(m_s.group(1)):02d}E{ep_num:02d}"
-                    return f"E{ep_num:02d}"
-                return ''
-
-            def _parse_quality(text):
-                """'EPiSODE 1 480p WEB-DL' → '480p WEB-DL', '' if none."""
-                if not text: return ''
-                m = _Q_RE.search(text)
-                return text[m.start():m.start()+30].strip() if m else ''
-
-            def _parse_lang(url):
-                if not url: return ''
-                u = url.lower()
-                if 'dual' in u: return 'Hindi-English'
-                if 'multi' in u: return 'Multi'
-                found = []
-                for kw, nm in _LANG_MAP.items():
-                    if kw in u and nm not in found: found.append(nm)
-                return '-'.join(found)
-
-            def _parse_size(url):
-                if not url: return ''
-                m = _SZ_RE.search(url)
-                return m.group(1).strip().upper().replace(' ','') if m else ''
-
-            def _clean_server_name(raw):
-                m = _SRV_RE.search(raw or '')
-                return m.group(1).strip() if m else (raw or '').strip()
-            # ────────────────────────────────────────────────────────────────
+            default_season = data_dict.get('Default_Season', 1)
 
             for link in bypassed_links:
                 raw_q  = link.get('quality', 'Unknown')
@@ -336,25 +276,58 @@ def save_movie_to_db(data_dict):
                 direct_links_data = link.get('direct_link')
 
                 def upsert_file(raw_quality, server_name_raw, srv_url, file_size):
-                    """Insert/update movie_file with correctly parsed columns."""
-                    # Parse episode → extra_info
-                    fallback = f"{data_dict.get('url', '')}"
-                    ep_str   = _parse_episode(raw_quality, fallback)
-                    # Parse real quality (480p etc.)
-                    real_q   = _parse_quality(raw_quality)
-                    if not real_q:
-                        real_q = _parse_quality(srv_url.split('/')[-1]) if srv_url else ''
-                    quality  = real_q if real_q else raw_quality
+                    import urllib.parse
+                    import re
+                    
+                    decoded_url = urllib.parse.unquote(srv_url) if srv_url else ""
+                    filename_match = re.search(r'filename=["\']?(.*?)["\'&]', decoded_url, re.IGNORECASE)
+                    actual_filename = filename_match.group(1) if filename_match else decoded_url
+                    
+                    combined_text = f"{actual_filename} {raw_quality}"
+                    
+                    is_combined = "[COMBINED]" in raw_quality
+                    js_ep_match = re.search(r'\[(E\d{1,3})\]', raw_quality)
+                    js_ep_str = js_ep_match.group(1) if js_ep_match else ""
 
-                    # Language from URL
-                    languages = _parse_lang(srv_url)
+                    ep_str = ""
+                    s_e_match = re.search(r'(?i)\bS(\d{1,2})[\s._-]*E(\d{1,3})\b', actual_filename)
+                    
+                    if s_e_match:
+                        ep_str = f"S{int(s_e_match.group(1)):02d}E{int(s_e_match.group(2)):02d}"
+                    else:
+                        if js_ep_str:
+                            ep_str = f"S{default_season:02d}{js_ep_str}"
+                        elif is_combined or re.search(r'(?i)\b(batch|full season|complete|all episodes|pack|zip)\b', combined_text):
+                            ep_str = f"S{default_season:02d} Combined"
 
-                    # Size from URL if not provided by scraper
+                    if final_category == "Movies":
+                        ep_str = ""
+
+                    quality = "HD"
+                    q_match = re.search(r'\b(2160p|1080p|720p|480p|360p|4K)\b', combined_text, re.IGNORECASE)
+                    if q_match:
+                        quality = q_match.group(1).lower()
+                        
+                    src_match = re.search(r'\b(WEB-DL|WEBRip|BluRay|HDRip|HDTC|HDTS|CAMRip)\b', combined_text, re.IGNORECASE)
+                    if src_match:
+                        quality += f" {src_match.group(1).upper()}"
+                        
+                    if quality == "HD" and re.search(r'\b(2160p|1080p|720p|480p|360p|4K)\b', raw_quality, re.IGNORECASE):
+                        quality = raw_quality
+
+                    langs = []
+                    lang_keywords = ['Hindi', 'English', 'Tamil', 'Telugu', 'Malayalam', 'Dual Audio', 'Multi']
+                    for l in lang_keywords:
+                        if re.search(r'\b' + l + r'\b', combined_text, re.IGNORECASE):
+                            langs.append(l.title())
+                    languages = ", ".join(sorted(list(set(langs)))) if langs else "Hindi"
+
                     if not file_size or file_size.lower() in ('', 'n/a', 'unknown'):
-                        file_size = _parse_size(srv_url)
+                        size_match = re.search(r'(?i)(\d+(?:\.\d+)?\s*(?:gb|mb))', combined_text)
+                        file_size = size_match.group(1).strip().upper().replace(' ','') if size_match else ""
 
-                    # Clean server_name 'Download [Buzz Server]' → 'Buzz Server'
-                    srv_name = _clean_server_name(server_name_raw)
+                    m_srv = re.search(r'(?i)download\s*\[(.+?)\]', server_name_raw or '')
+                    srv_name = m_srv.group(1).strip() if m_srv else (server_name_raw or '').strip()
 
                     cur.execute(
                         "SELECT id FROM movie_files WHERE movie_id = %s AND quality = %s AND server_name = %s AND extra_info = %s",
@@ -363,19 +336,14 @@ def save_movie_to_db(data_dict):
                     if cur.fetchone():
                         cur.execute("""
                             UPDATE movie_files
-                            SET url = %s, file_size = %s, languages = %s,
-                                source = 'scraped'
+                            SET url = %s, file_size = %s, languages = %s, source = 'scraped'
                             WHERE movie_id = %s AND quality = %s AND server_name = %s AND extra_info = %s
-                        """, (srv_url, file_size, languages,
-                               movie_id, quality, srv_name, ep_str))
+                        """, (srv_url, file_size, languages, movie_id, quality, srv_name, ep_str))
                     else:
                         cur.execute("""
-                            INSERT INTO movie_files
-                                (movie_id, quality, server_name, url, file_size,
-                                 languages, extra_info, source)
+                            INSERT INTO movie_files (movie_id, quality, server_name, url, file_size, languages, extra_info, source)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, 'scraped')
-                        """, (movie_id, quality, srv_name, srv_url,
-                               file_size, languages, ep_str))
+                        """, (movie_id, quality, srv_name, srv_url, file_size, languages, ep_str))
 
                 if isinstance(direct_links_data, list):
                     for srv in direct_links_data:
@@ -396,31 +364,7 @@ def save_movie_to_db(data_dict):
         print(f"DB Save Error: {e}")
 
 # =====================================================================
-# GITHUB RUNNER RELAY LOGIC (24/7 Loop)
-# =====================================================================
-def trigger_next_github_runner():
-    # Ye GitHub Actions ke environment variables se aayega
-    token = os.environ.get("GH_TOKEN")
-    repo = os.environ.get("GITHUB_REPOSITORY") 
-    
-    if not token or not repo:
-        print("⚠️ GitHub token not found. Skipping auto-trigger (running locally?).")
-        return
-        
-    print("🔄 5h 45m limit reached. Triggering next GitHub Runner...")
-    url = f"https://api.github.com/repos/{repo}/actions/workflows/bot_runner.yml/dispatches"
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    res = requests.post(url, headers=headers, json={"ref": "main"})
-    if res.status_code == 204:
-        print("✅ New server successfully triggered! Old server resting.")
-    else:
-        print(f"❌ Failed to trigger runner: {res.text}")
-
-# =====================================================================
-# BYPASS MODULES 
+# BYPASS MODULES (With DEAD LINK DETECTOR)
 # =====================================================================
 async def bypass_hubcdn_mediator(context, target_url):
     page = await context.new_page()
@@ -428,6 +372,14 @@ async def bypass_hubcdn_mediator(context, target_url):
         await page.goto(target_url, timeout=60000)
         await page.wait_for_timeout(10000) 
         
+        is_dead = await page.evaluate('''() => {
+            let text = document.body.innerText.toLowerCase();
+            return text.includes('file not found') || text.includes('file was deleted') || text.includes('no longer available') || text.includes('404 not found');
+        }''')
+        if is_dead:
+            print(f"   ⚠️ DEAD LINK SKIPPED: {target_url}", flush=True)
+            return None
+
         clicked_step1 = await page.evaluate('''() => {
             let btn = Array.from(document.querySelectorAll('a, button')).find(e => e.innerText.includes('CLICK TO CONTINUE'));
             if(btn) { btn.click(); return true; } return false;
@@ -465,6 +417,14 @@ async def bypass_hubcloud_chain(context, hubdrive_url):
         await page.goto(hubdrive_url, timeout=60000, wait_until="domcontentloaded")
         await page.wait_for_timeout(4000)
 
+        is_dead = await page.evaluate('''() => {
+            let text = document.body.innerText.toLowerCase();
+            return text.includes('file not found') || text.includes('file was deleted') || text.includes('no longer available') || text.includes('404 not found') || text.includes('file has been deleted');
+        }''')
+        if is_dead:
+            print(f"   ⚠️ DEAD LINK SKIPPED: {hubdrive_url}", flush=True)
+            return None
+
         hubcloud_url = await page.evaluate('''() => {
             let links = Array.from(document.querySelectorAll('a'));
             let target = links.find(a => a.innerText.toLowerCase().includes('hubcloud server'));
@@ -476,6 +436,14 @@ async def bypass_hubcloud_chain(context, hubdrive_url):
         if page.url != hubcloud_url:
             await page.goto(hubcloud_url, timeout=60000, wait_until="domcontentloaded")
         await page.wait_for_timeout(8000)
+
+        is_dead_final = await page.evaluate('''() => {
+            let text = document.body.innerText.toLowerCase();
+            return text.includes('file not found') || text.includes('file was deleted') || text.includes('no longer available');
+        }''')
+        if is_dead_final:
+            print(f"   ⚠️ DEAD LINK SKIPPED: {hubcloud_url}", flush=True)
+            return None
 
         gamerxyt_url = await page.evaluate('''() => {
             let links = Array.from(document.querySelectorAll('a'));
@@ -529,157 +497,6 @@ async def process_single_link(browser, sem, raw_link_data):
         return {"quality": quality, "size": size, "direct_link": direct_link}
 
 # =====================================================================
-# DATA EXTRACTION & TMDB
-# =====================================================================
-def fix_movie_details(scraped_data, movie_url=None):
-    site_clean_title = scraped_data.get('Site_Clean_Title', '')
-    fixed_title = re.sub(r'\(.*?\)', '', site_clean_title) 
-    fixed_title = re.sub(r'\[.*?\]', '', fixed_title)      
-    search_query = fixed_title.strip()
-
-    if not search_query or search_query == 'N/A':
-        raw_t = scraped_data.get('Raw_Title', '').replace('', '').strip()
-        if raw_t and raw_t != 'N/A':
-            search_query = re.split(r'\(|\[', raw_t)[0].strip()
-    
-    # ULTIMATE FALLBACK: Extract title from URL slug
-    # e.g. "thor-ragnarok-2017-hindi-dual-audio-720p" → "thor ragnarok"
-    if (not search_query or search_query == 'N/A') and movie_url:
-        try:
-            slug = movie_url.rstrip('/').split('/')[-1]  # "thor-ragnarok-2017-hindi-dual-audio-720p-hdrip-esubs-1gb"
-            # Remove common junk words from slug
-            junk_words = ['hindi', 'english', 'dual', 'audio', 'dubbed', 'uncut', 'hdrip', 'webrip', 
-                         'bluray', 'web', 'dl', 'esubs', 'esub', '480p', '720p', '1080p', '4k',
-                         'x264', 'x265', 'hevc', 'aac', 'mb', 'gb', 'full', 'movie', 'hd',
-                         'pre', 'dvdrip', 'brrip', 'hdtc', 'camrip', 'south', 'bollywood',
-                         'hollywood', 'series', 'season', 'complete', 'all', 'episodes']
-            parts = slug.split('-')
-            clean_parts = []
-            for p in parts:
-                # Stop at year (4 digits)
-                if re.match(r'^\d{4}$', p):
-                    break
-                # Stop at file size (300mb, 1gb, etc)
-                if re.match(r'^\d+[mg]b?$', p, re.IGNORECASE):
-                    break
-                if p.lower() not in junk_words and len(p) > 1:
-                    clean_parts.append(p)
-            search_query = ' '.join(clean_parts).strip()
-            if search_query:
-                print(f"   🔗 Title extracted from URL: '{search_query}'", flush=True)
-        except:
-            pass
-    
-    if not search_query or search_query == 'N/A':
-        search_query = 'UNKNOWN_TITLE'
-    
-    scraped_data['Search_Query'] = search_query
-    return scraped_data
-
-def get_tmdb_details(fixed_data):
-    TMDB_KEY = "9fa44f5e9fbd41415df930ce5b81c4d7"
-    search_query = fixed_data['Search_Query']
-    year_hint = fixed_data['Year']
-    type_hint = 'tv' if fixed_data['Type'] == 'TV Series' else 'movie'
-    
-    lang_str = fixed_data['Language'].lower()
-    target_orig_lang = None
-    if 'hindi' in lang_str: target_orig_lang = 'hi'
-    elif 'tamil' in lang_str: target_orig_lang = 'ta'
-    elif 'telugu' in lang_str: target_orig_lang = 'te'
-    elif 'malayalam' in lang_str: target_orig_lang = 'ml'
-
-    url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_KEY}&query={urllib.parse.quote(search_query)}"
-    try:
-        response = requests.get(url).json()
-        if not response.get('results'): 
-            # Generate a unique positive integer above 900,000,000 based on the movie URL or title
-            import hashlib
-            unique_hash = int(hashlib.md5(search_query.encode()).hexdigest(), 16)
-            fallback_id = (unique_hash % 100000000) + 900000000 
-            return {
-                "Matched_Type": type_hint.upper(),
-                "Orig_Language": target_orig_lang.upper() if target_orig_lang else "UNKNOWN",
-                "Title": search_query,
-                "Release": year_hint,
-                "tmdb_id": fallback_id,
-                "Overview": "N/A",
-                "Poster": None,
-                "is_tv": type_hint == 'tv'
-            }
-        results = response['results']
-        best_match = None
-
-        if target_orig_lang:
-            for res in results:
-                if res.get('media_type') == type_hint and res.get('original_language') == target_orig_lang:
-                    res_date = res.get('release_date') or res.get('first_air_date', '')
-                    if year_hint != 'N/A' and res_date.startswith(str(year_hint)):
-                        best_match = res; break
-                    elif year_hint == 'N/A':
-                        best_match = res; break
-
-        if not best_match and year_hint != 'N/A':
-            for res in results:
-                res_date = res.get('release_date') or res.get('first_air_date', '')
-                if res.get('media_type') == type_hint and res_date.startswith(str(year_hint)):
-                    best_match = res; break
-
-        if not best_match:
-            for res in results:
-                if res.get('media_type') == type_hint:
-                    best_match = res; break
-        if not best_match:
-            # Dangerous mismatch (like 1737451) usually happens here when taking a random results[0].
-            import hashlib
-            unique_hash = int(hashlib.md5(search_query.encode()).hexdigest(), 16)
-            fallback_id = (unique_hash % 100000000) + 900000000 
-            return {
-                "Matched_Type": type_hint.upper(),
-                "Orig_Language": target_orig_lang.upper() if target_orig_lang else "UNKNOWN",
-                "Title": search_query,
-                "Release": year_hint,
-                "tmdb_id": fallback_id,
-                "Overview": "N/A",
-                "Poster": None,
-                "is_tv": type_hint == 'tv'
-            }
-
-        return {
-            "Matched_Type": best_match.get('media_type', 'unknown').upper(),
-            "Orig_Language": best_match.get('original_language', 'unknown').upper(),
-            "Title": best_match.get('title') or best_match.get('name'),
-            "Release": best_match.get('release_date') or best_match.get('first_air_date', 'N/A'),
-            "TMDb_Rating": best_match.get('vote_average', 'N/A'),
-            # TMDB ID — unique content identifier (stored in imdb_id column)
-            "tmdb_id": best_match.get('id'),
-            # Backdrop poster (wide banner) prefer karo, fallback to regular poster
-            "Poster": (
-                f"https://image.tmdb.org/t/p/w1280{best_match.get('backdrop_path')}"
-                if best_match.get('backdrop_path')
-                else (
-                    f"https://image.tmdb.org/t/p/w500{best_match.get('poster_path')}"
-                    if best_match.get('poster_path') else 'N/A'
-                )
-            ),
-            "is_tv": best_match.get('media_type') == 'tv'
-        }
-    except Exception as e:
-        import hashlib
-        unique_hash = int(hashlib.md5(search_query.encode()).hexdigest(), 16)
-        fallback_id = (unique_hash % 100000000) + 900000000 
-        return {
-            "Matched_Type": type_hint.upper(),
-            "Orig_Language": target_orig_lang.upper() if target_orig_lang else "UNKNOWN",
-            "Title": search_query,
-            "Release": year_hint,
-            "tmdb_id": fallback_id,
-            "Overview": "N/A",
-            "Poster": None,
-            "is_tv": type_hint == 'tv'
-        }
-
-# =====================================================================
 # CORE LOGIC: PROCESS A SINGLE MOVIE
 # =====================================================================
 async def scrape_and_save_movie(movie_link, browser, main_context, sem):
@@ -696,13 +513,11 @@ async def scrape_and_save_movie(movie_link, browser, main_context, sem):
             let lines = text.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
             let details = { Raw_Title: 'N/A', Site_Clean_Title: 'N/A', Year: 'N/A', Type: 'Movie', IMDb: 'N/A', Genre: 'N/A', Stars: 'N/A', Director: 'N/A', Creator: 'N/A', Language: 'N/A', Quality: 'N/A', Description: 'N/A' };
 
-            // METHOD 1: Get title from H1 heading tag (most reliable)
             let h1 = document.querySelector('h1.entry-title, h1.post-title, h1');
             if (h1) {
                 details.Raw_Title = h1.innerText.trim();
             }
             
-            // METHOD 2: If H1 failed, try the line before "imdb rating:"
             if (details.Raw_Title === 'N/A' || details.Raw_Title.length < 5) {
                 let imdbIdx = lines.findIndex(l => l.toLowerCase().includes('imdb rating:'));
                 if (imdbIdx > 0) {
@@ -710,7 +525,6 @@ async def scrape_and_save_movie(movie_link, browser, main_context, sem):
                 }
             }
             
-            // METHOD 3: If still failed, find any line with a year pattern like (2017)
             if (details.Raw_Title === 'N/A' || details.Raw_Title.length < 5) {
                 for (let line of lines) {
                     if (line.match(/\\(\\d{4}\\)/) && line.length > 10 && line.length < 200) {
@@ -720,23 +534,8 @@ async def scrape_and_save_movie(movie_link, browser, main_context, sem):
                 }
             }
             
-            // Strip private-use Unicode characters (U+E000-U+F8FF range) from Raw_Title
             details.Raw_Title = details.Raw_Title.replace(/[\\uE000-\\uF8FF]/g, '').trim();
             
-            // Extract year from title
-            let yearMatch = details.Raw_Title.match(/\\((\\d{4})\\)/);
-            if (yearMatch) details.Year = yearMatch[1];
-            
-            // Site_Clean_Title: line before "imdb rating:"
-            let imdbIndex = lines.findIndex(l => l.toLowerCase().includes('imdb rating:'));
-            if (imdbIndex > 0) {
-                details.Site_Clean_Title = lines[imdbIndex - 1].replace(/[\\uE000-\\uF8FF]/g, '').trim();
-            }
-            // If Site_Clean_Title is still N/A, use Raw_Title
-            if (details.Site_Clean_Title === 'N/A' && details.Raw_Title !== 'N/A') {
-                details.Site_Clean_Title = details.Raw_Title;
-            }
-
             let imdbMatch = text.match(/iMDB Rating:\\s*(.*)/i);
             if(imdbMatch) details.IMDb = imdbMatch[1].trim();
             let genreMatch = text.match(/Genre:\\s*(.*)/i);
@@ -752,16 +551,9 @@ async def scrape_and_save_movie(movie_link, browser, main_context, sem):
             
             let langMatch = text.match(/Language:\\s*(.*)/i);
             if(langMatch) details.Language = langMatch[1].trim();
-            let qMatch = text.match(/Quality:\\s*(.*)/i);
-            if(qMatch) details.Quality = qMatch[1].trim();
-
-            let audioMatch = text.match(/(Audio Tracks:[\\s\\S]*?)(?:Language:|Screenshots:|Quality:|Download Links|$)/i);
-            if(audioMatch) {
-                details.Description = audioMatch[1].trim();
-            } else {
-                let plotMatch = text.match(/(?:Storyline|Plot):([\\s\\S]*?)(?:Director:|Stars:|Genre:|$)/i);
-                if (plotMatch) details.Description = plotMatch[1].trim();
-            }
+            
+            let plotMatch = text.match(/(?:Storyline|Plot):([\\s\\S]*?)(?:Director:|Stars:|Genre:|$)/i);
+            if (plotMatch) details.Description = plotMatch[1].trim();
 
             return details;
         }''')
@@ -769,26 +561,58 @@ async def scrape_and_save_movie(movie_link, browser, main_context, sem):
         raw_links = await movie_page.evaluate('''() => {
             let links = Array.from(document.querySelectorAll('a'));
             let results = [];
+            let validKeywords = ['hubdrive', 'hubcloud', 'hubcdn', 'greenmountmotors', 'inventoryidea', 'indishare', 'sendit', 'clicknupload', 'upload.mn', 'openload', 'bdupload', '9xupload', 'uploadbaz', 'upfile', 'more download links', '9xplay'];
+
             links.forEach(a => {
                 let href = a.href.toLowerCase();
-                if (href.includes('hubdrive') || href.includes('hubcloud') || href.includes('hubcdn') || href.includes('greenmountmotors') || href.includes('inventoryidea')) {
-                    let btnText = a.innerText.trim() || (a.parentElement ? a.parentElement.innerText.trim() : "Link");
-                    let cleanText = btnText.replace(/\\n/g, ' ');
+                let btnText = a.innerText.trim();
+                let parentText = a.parentElement ? a.parentElement.innerText.trim().replace(/\\n/g, ' ') : "";
+                
+                let isTarget = validKeywords.some(kw => href.includes(kw) || btnText.toLowerCase().includes(kw));
+                
+                if (isTarget) {
+                    if (btnText.toLowerCase().includes('sample')) return;
+
+                    // CHECK & SKIP: Watch Online links
+                    let isWatch = btnText.toLowerCase().includes('watch') || btnText.toLowerCase().includes('play') || parentText.toLowerCase().includes('watch');
+                    if (isWatch) return;
                     
-                    let quality = cleanText;
-                    let size = "";
+                    // DOM SCANNER: Episode Number or Full Season?
+                    let epContext = "";
+                    let isCombined = false;
+                    let node = a;
                     
-                    if (cleanText.toLowerCase().includes('sample')) {
-                        return; // Ignore sample files completely!
+                    for (let i = 0; i < 4 && node; i++) {
+                        let prev = node.previousElementSibling;
+                        for (let j = 0; j < 10 && prev; j++) {
+                            let pText = (prev.innerText || "").trim().toLowerCase();
+                            
+                            let matchEp = pText.match(/(?:episode|ep)\\s*[\\-:]?\\s*(\\d{1,3})/i);
+                            if (matchEp) {
+                                epContext = `E${matchEp[1].padStart(2, '0')}`;
+                                break;
+                            }
+                            if (pText.includes('download links') || pText.includes('full series') || pText.includes('complete season') || pText.includes('zip') || pText.includes('batch') || pText.includes('pack')) {
+                                isCombined = true;
+                                break;
+                            }
+                            prev = prev.previousElementSibling;
+                        }
+                        if (epContext || isCombined) break;
+                        node = node.parentElement;
                     }
+
+                    let combinedText = parentText.length < 100 ? parentText : btnText;
                     
-                    let sizeMatch = cleanText.match(/(.*?)\\[(.*?)\\]/);
-                    if (sizeMatch) {
-                        quality = sizeMatch[1].trim();
-                        size = sizeMatch[2].trim();
+                    let prefix = "";
+                    if (epContext) prefix += `[${epContext}] `;
+                    if (isCombined && !epContext) prefix += "[COMBINED] ";
+
+                    let finalQuality = prefix + combinedText;
+
+                    if (!results.find(r => r.url === a.href)) {
+                        results.push({ quality: finalQuality, size: "", url: a.href });
                     }
-                    
-                    results.push({ quality: quality, size: size, url: a.href });
                 }
             });
             return results;
@@ -800,45 +624,6 @@ async def scrape_and_save_movie(movie_link, browser, main_context, sem):
         title_to_check = tmdb_data.get('Title') if tmdb_data else None
         if not title_to_check:
             title_to_check = fixed_data.get('Search_Query')
-
-        is_tv_series = (
-            fixed_data.get('Type') == 'TV Series' or
-            (tmdb_data and tmdb_data.get('is_tv', False))
-        )
-
-        # --- DUPLICATE CHECK: TMDB ID se pehle (most reliable) ---
-        tmdb_id = tmdb_data.get('tmdb_id') if tmdb_data else None
-        if tmdb_id:
-            already_exists, existing_movie_id = check_movie_by_tmdb_id(tmdb_id)
-            if already_exists:
-                if is_tv_series:
-                    existing = get_existing_seasons_episodes(title_to_check or '')
-                    if existing:
-                        print(f"📺 [TMDB:{tmdb_id}] SERIES EXISTS: '{title_to_check}' — {len(existing)} entries in DB")
-                        for q, servers in existing.items():
-                            print(f"      → {q} ({len(servers)} server(s))")
-                        print(f"   🔄 Continuing to find missing seasons/episodes...")
-                    else:
-                        print(f"📺 [TMDB:{tmdb_id}] SERIES EXISTS but no files — re-scraping '{title_to_check}'")
-                else:
-                    print(f"⏩ SKIP [TMDB:{tmdb_id}]: Already in DB → {title_to_check}")
-                    return
-        else:
-            # Fallback: Multi-field scoring duplicate check (title + year + stars + director)
-            dup_found, dup_movie_id, dup_score = find_duplicate_movie(scraped_data, tmdb_data)
-            if dup_found:
-                if is_tv_series:
-                    existing = get_existing_seasons_episodes(title_to_check or '')
-                    if existing:
-                        print(f"📺 SERIES EXISTS [score={dup_score}]: '{title_to_check}' — {len(existing)} entries in DB")
-                        for q, servers in existing.items():
-                            print(f"      → {q} ({len(servers)} server(s))")
-                        print(f"   🔄 Continuing scrape to find any missing seasons/episodes...")
-                    else:
-                        print(f"📺 SERIES EXISTS but NO movie_files found — re-scraping '{title_to_check}'")
-                else:
-                    print(f"⏩ SKIP [score={dup_score}]: Duplicate detected → {title_to_check}")
-                    return
 
         bypassed_links_data = []
         if raw_links:
@@ -852,15 +637,20 @@ async def scrape_and_save_movie(movie_link, browser, main_context, sem):
         db_payload = {
             "url": movie_link,
             "raw_title": fixed_data['Raw_Title'],
-            "type": fixed_data['Type'],
-            "imdb": fixed_data['IMDb'],
+            "clean_title": fixed_data['Search_Query'],
+            "Type": fixed_data['Type'],
+            "Default_Season": fixed_data['Default_Season'],
+            "imdb": fixed_data['IMDb'], 
             "tmdb_data": tmdb_data,
-            "genre": fixed_data.get('Genre', 'N/A'),
+            "Genre": fixed_data.get('Genre', 'N/A'),
+            "Stars": fixed_data.get('Stars', 'N/A'),
+            "Language": fixed_data.get('Language', 'N/A'),
             "description": fixed_data.get('Description', 'N/A'),
             "bypassed_links": bypassed_links_data
         }
+        
         save_movie_to_db(db_payload)
-        print(f"💾 Saved to Database -> {fixed_data['Site_Clean_Title']}")
+        print(f"💾 Saved to Database -> {title_to_check}")
 
     except Exception as e:
         print(f"❌ Error extracting {movie_link}: {e}")
@@ -868,18 +658,37 @@ async def scrape_and_save_movie(movie_link, browser, main_context, sem):
         await movie_page.close()
 
 # =====================================================================
-# HOURLY INTERRUPT CHECKER (Checks Postgres status)
+# GITHUB RUNNER RELAY & HOURLY CHECK LOGIC
 # =====================================================================
+def trigger_next_github_runner():
+    token = os.environ.get("GH_TOKEN")
+    repo = os.environ.get("GITHUB_REPOSITORY") 
+    
+    if not token or not repo:
+        print("⚠️ GitHub token not found. Skipping auto-trigger (running locally?).")
+        return
+        
+    print("🔄 5h 45m limit reached. Triggering next GitHub Runner...")
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/bot_runner.yml/dispatches"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    res = requests.post(url, headers=headers, json={"ref": "main"})
+    if res.status_code == 204:
+        print("✅ New server successfully triggered! Old server resting.")
+    else:
+        print(f"❌ Failed to trigger runner: {res.text}")
+
 async def run_hourly_check(browser, main_context, sem):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # Check if table exists first
         cur.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'bot_commands');")
         if not cur.fetchone()[0]:
             cur.close()
             conn.close()
-            return  # Table nahi hai, skip karo silently
+            return 
         
         cur.execute("SELECT status FROM bot_commands WHERE task = 'hourly_check';")
         res = cur.fetchone()
@@ -924,11 +733,10 @@ async def run_hourly_check(browser, main_context, sem):
 # =====================================================================
 async def master_auto_scraper(start_page, end_page):
     print("=" * 60, flush=True)
-    print("🚀 SCRAPER STARTED", flush=True)
+    print("🚀 MASTER SCRAPER STARTED", flush=True)
     print(f"⏰ Time: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
     print("=" * 60, flush=True)
     
-    # DB connection test
     print("🔌 Testing Database Connection...", flush=True)
     try:
         test_conn = get_db_connection()
@@ -936,28 +744,24 @@ async def master_auto_scraper(start_page, end_page):
         print("✅ Database Connected Successfully!", flush=True)
     except Exception as e:
         print(f"❌ Database Connection FAILED: {e}", flush=True)
-        print("⚠️ Continuing anyway - will retry on each operation", flush=True)
     
     start_time = time.time()
-    MAX_RUN_TIME = (5 * 3600) + (45 * 60) # 5 Hours 45 Minutes limit for GitHub
+    MAX_RUN_TIME = (5 * 3600) + (45 * 60)
 
     try:
         print("🎭 Starting Playwright...", flush=True)
         async with async_playwright() as p:
-            print("🌐 Launching Chromium (headless=True)...", flush=True)
             browser = await p.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
             )
-            print("✅ Chromium Launched!", flush=True)
             main_context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             )
             await main_context.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media"] else route.continue_())
             
             page = await main_context.new_page()
-            sem = asyncio.Semaphore(20) 
-            print("✅ Browser ready, starting scrape!", flush=True)
+            sem = asyncio.Semaphore(10) 
 
             page_num = start_page
             while page_num <= end_page:
@@ -968,7 +772,6 @@ async def master_auto_scraper(start_page, end_page):
                 
                 try:
                     await page.goto(current_url, timeout=60000, wait_until="domcontentloaded")
-                    print(f"✅ Page {page_num} loaded, extracting movie links...", flush=True)
                 except Exception as e:
                     print(f"❌ Failed to load page {page_num}: {e}", flush=True)
                     page_num += 1
@@ -994,34 +797,29 @@ async def master_auto_scraper(start_page, end_page):
                 print(f"📋 Found {len(movies_on_page)} movies on page {page_num}", flush=True)
                 
                 if len(movies_on_page) == 0:
-                    print("⚠️ 0 movies found, skipping page", flush=True)
                     page_num += 1
                     continue
 
-                # 1. Check for Postgres Hourly Flag (ONCE PER PAGE)
                 await run_hourly_check(browser, main_context, sem)
 
                 for movie_link in movies_on_page:
-                    # ⏱️ TIME CHECK EVERY MOVIE (For GitHub Relay)
                     if time.time() - start_time > MAX_RUN_TIME:
                         print("⏳ Time limit reaching! Handing over to next runner...", flush=True)
                         trigger_next_github_runner()
                         sys.exit(0)
                         
-                    tmdb_id = None
-                    movie_title = None
-                    
-                    # 2. Process Movie (Skips if already in Postgres DB)
                     await scrape_and_save_movie(movie_link, browser, main_context, sem)
                     
                 page_num += 1
 
     except KeyboardInterrupt:
         print("\n🛑 Process stopped manually.")
+    finally:
+        pass
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Matrix Scraper Bot")
+    parser = argparse.ArgumentParser(description="Master Scraper Bot")
     parser.add_argument("--start_page", type=int, required=True, help="Start page number")
     parser.add_argument("--end_page", type=int, required=True, help="End page number")
     args = parser.parse_args()
