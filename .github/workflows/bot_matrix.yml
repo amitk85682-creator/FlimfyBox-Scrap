@@ -6,6 +6,7 @@ on:
 jobs:
   scrape-matrix:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -37,9 +38,14 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install requests playwright psycopg2-binary nest-asyncio
+          pip install -r requirements.txt
           playwright install chromium
+          playwright install-deps chromium
 
       - name: Run Scraper Bot ${{ matrix.bot }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PYTHONUNBUFFERED: "1"
         run: |
           python scraper.py --start_page ${{ matrix.start }} --end_page ${{ matrix.end }}

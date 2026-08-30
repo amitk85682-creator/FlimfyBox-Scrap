@@ -1,12 +1,22 @@
 name: 24/7 Movie Bot Scraper
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
+    inputs:
+      start_page:
+        description: 'Start page number'
+        required: false
+        default: '1'
+      end_page:
+        description: 'End page number'
+        required: false
+        default: '1016'
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 360
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
@@ -25,5 +35,6 @@ jobs:
       - name: Run Scraper Bot
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           PYTHONUNBUFFERED: "1"
-        run: python scraper.py
+        run: python scraper.py --start_page ${{ github.event.inputs.start_page }} --end_page ${{ github.event.inputs.end_page }}
