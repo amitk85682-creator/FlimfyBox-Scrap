@@ -634,6 +634,12 @@ async def scrape_and_save_movie(movie_link, browser, main_context, sem):
                     bypassed_links_data.append(res)
                     print(f"    ✅ [{res['quality']}] -> SUCCESS")
 
+        # 🛑 NAYA LOCK: Agar bypassed_links_data ekdum khali hai (0 links), toh DB mein save mat karo!
+        if not bypassed_links_data:
+            print(f"   ⚠️ SKIP: No valid download links found for '{title_to_check}'. Ignoring movie.", flush=True)
+            return
+
+        # 💡 FINAL FIX: PASS EXACT PAGE DATA TO DB PAYLOAD
         db_payload = {
             "url": movie_link,
             "raw_title": fixed_data['Raw_Title'],
