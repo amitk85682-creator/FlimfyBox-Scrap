@@ -41,41 +41,57 @@ def fix_movie_details(scraped_data, movie_url=None):
     raw_title = scraped_data.get('Raw_Title', '').replace('🎬', '').strip()
     search_query = 'UNKNOWN_TITLE'
     year = 'N/A'
-    media_type = 'Movie'
-    default_season = 1  
+    media_type = 'Movies' # 💡 Default is Movies
+    season_number = None  # 💡 Movies mein koi season nahi hota!
 
     if raw_title and raw_title != 'N/A':
+        # Bracket se pehle ka hissa = Main Title
         title_parts = re.split(r'\(|\[', raw_title)
         search_query = title_parts[0].strip()
 
+        # 💡 TUMHARA RULE: Brackets ke andar check karo
         brackets_content = re.findall(r'\((.*?)\)|\[(.*?)\]', raw_title)
         bracket_texts = [item for sublist in brackets_content for item in sublist if item]
         
         for text in bracket_texts:
             text_lower = text.lower().strip()
+            # Agar 4 numbers hain -> Year -> Movie
             if re.match(r'^\d{4}$', text_lower):
                 year = text_lower
+                media_type = 'Movies'
+            # Agar Season hai -> Web Series
             elif "season" in text_lower or re.match(r'^s\d+', text_lower):
-                media_type = 'TV Series'
+                media_type = 'Web Series'
+                s_match = re.search(r'(?i)(?:season|s)\s*(\d+)', text_lower)
+                if s_match:
+                    season_number = int(s_match.group(1))
 
-        s_match = re.search(r'(?i)\bseason\s*(\d+)', raw_title)
-        if s_match:
-            media_type = 'TV Series'
-            default_season = int(s_match.group(1))
-            search_query = re.sub(r'(?i)\bseason\s*\d+.*', '', search_query).strip()
-        elif re.search(r'(?i)\bepisode\b', raw_title):
-            media_type = 'TV Series'
+        # Main title mein agar bina bracket ke 'Season' likha hai
+        if media_type != 'Web Series':
+            s_match = re.search(r'(?i)\bseason\s*(\d+)', raw_title)
+            if s_match:
+                media_type = 'Web Series'
+                season_number = int(s_match.group(1))
+                search_query = re.sub(r'(?i)\bseason\s*\d+.*', '', search_query).strip()
+            elif re.search(r'(?i)\bepisode\b', raw_title):
+                media_type = 'Web Series'
 
+    # Agar Web Series hai par season number match nahi hua, toh 1 manenge
+    if media_type == 'Web Series' and season_number is None:
+        season_number = 1
+
+    # Fallback via URL
     if not search_query or search_query == 'UNKNOWN_TITLE':
         if movie_url:
             try:
                 slug = movie_url.rstrip('/').split('/')[-1]
                 if 'season' in slug.lower() or 'episode' in slug.lower():
-                    media_type = 'TV Series'
+                    media_type = 'Web Series'
+                    if season_number is None: season_number = 1
                 
                 s_match_url = re.search(r'(?i)season-(\d+)', slug)
                 if s_match_url:
-                    default_season = int(s_match_url.group(1))
+                    season_number = int(s_match_url.group(1))
 
                 junk_words = ['hindi', 'english', 'dual', 'audio', 'dubbed', 'uncut', 'hdrip', 'webrip', 
                               'bluray', 'web', 'dl', 'esubs', 'esub', '480p', '720p', '1080p', '4k',
@@ -87,6 +103,7 @@ def fix_movie_details(scraped_data, movie_url=None):
                 for p in parts:
                     if re.match(r'^\d{4}$', p):
                         year = p
+                        if media_type != 'Web Series': media_type = 'Movies'
                         break
                     if re.match(r'^\d+[mg]b?$', p, re.IGNORECASE):
                         break
@@ -102,9 +119,11 @@ def fix_movie_details(scraped_data, movie_url=None):
     scraped_data['Search_Query'] = search_query
     scraped_data['Year'] = year
     scraped_data['Type'] = media_type
-    scraped_data['Default_Season'] = default_season  
+    scraped_data['Default_Season'] = season_number  
     
-    print(f"   ✅ Cleaned Title: '{search_query}' | Season: {default_season} | Type: '{media_type}'", flush=True)
+    # 💡 AB PRINT EKDUM CLEAN AAYEGA! Movie ke aage Season ka tag nahi hoga.
+    season_print = f" | Season: {season_number}" if media_type == 'Web Series' else ""
+    print(f"   ✅ Cleaned Title: '{search_query}'{season_print} | Type: '{media_type}'", flush=True)
     return scraped_data
 
 # =====================================================================
@@ -113,7 +132,7 @@ def fix_movie_details(scraped_data, movie_url=None):
 def get_tmdb_details(fixed_data):
     search_query = fixed_data['Search_Query']
     year_hint = fixed_data['Year']
-    type_hint = 'tv' if fixed_data['Type'] == 'TV Series' else 'movie'
+    type_hint = 'tv' if fixed_data['Type'] == 'Web Series' else 'movie' # 💡 'Web Series' match
 
     print(f"   🌐 Fetching LIVE data from TMDB for: {search_query} (Type: {type_hint})...", flush=True)
     
@@ -229,7 +248,8 @@ def save_movie_to_db(data_dict):
         imdb_id_real = tmdb.get('imdb_id')
         seasons_json = tmdb.get('seasons_data', {})
         
-        final_category = "Web Series" if data_dict.get('Type') == 'TV Series' or tmdb.get('is_tv') else "Movies"
+        # 💡 FINAL FIX: Exactly jo type assign hua hai, wahi Category banegi
+        final_category = "Web Series" if data_dict.get('Type') == 'Web Series' or tmdb.get('is_tv') else "Movies"
         
         try: year_val = int(year)
         except: year_val = None
@@ -268,7 +288,8 @@ def save_movie_to_db(data_dict):
         
         if movie_id:
             bypassed_links = data_dict.get('bypassed_links', [])
-            default_season = data_dict.get('Default_Season', 1)
+            # Agar default season None hai (Movie ke case mein), toh 1 maan lo safety ke liye taaki integer error na ho
+            default_season = data_dict.get('Default_Season') or 1
 
             for link in bypassed_links:
                 raw_q  = link.get('quality', 'Unknown')
@@ -300,6 +321,7 @@ def save_movie_to_db(data_dict):
                         elif is_combined or re.search(r'(?i)\b(batch|full season|complete|all episodes|pack|zip)\b', combined_text):
                             ep_str = f"S{default_season:02d} Combined"
 
+                    # 🚨 SAFETY LOCK: Agar ye Movies hai, toh Episode String ko khali ('') kardo!
                     if final_category == "Movies":
                         ep_str = ""
 
