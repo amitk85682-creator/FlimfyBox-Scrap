@@ -1,0 +1,31 @@
+name: Daily Dead Link Cleaner
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Har roz subah 5:30 AM (IST) chalega
+  workflow_dispatch:     # GitHub action tab se manual run karne ke liye button
+
+jobs:
+  auto-clean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # Agar links zyada hon toh 2 ghante tak ka time de diya
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install psycopg2-binary aiohttp nest_asyncio playwright
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run Terminator Auto-Cleaner
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}  # 👈 Yahan GitHub Secrets se DB URL aayega
+        run: python link_checker.py  # Apni script ka jo bhi naam rakha hai wo daal dena
