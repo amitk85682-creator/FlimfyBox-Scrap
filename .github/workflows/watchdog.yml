@@ -1,0 +1,30 @@
+name: Hourly Page 1 Watchdog
+
+on:
+  schedule:
+    # Runs at 06:00, 12:00, 16:00, 21:00, and 00:00 IST
+    - cron: '30 0,6,10,15,18 * * *'  
+  workflow_dispatch:
+
+jobs:
+  auto-updater:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install psycopg2-binary aiohttp nest_asyncio playwright requests
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run Watchdog Mode
+        run: python scraper.py --mode watchdog
