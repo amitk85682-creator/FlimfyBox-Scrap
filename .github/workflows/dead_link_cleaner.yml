@@ -1,0 +1,38 @@
+name: 10x Fast Dead Link Cleaner
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Roz raat UTC 00:00 (India time subah 5:30) chalega
+  workflow_dispatch:     # GitHub Actions tab me "Run Workflow" button ke liye
+
+jobs:
+  parallel-cleaner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 
+    strategy:
+      fail-fast: false   
+      matrix:
+        # Ye bot ki 10 copies banayega (0 se 9)
+        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install psycopg2-binary aiohttp nest_asyncio playwright
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run Cleaner Script
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CHUNK_INDEX: ${{ matrix.chunk }}
+          TOTAL_CHUNKS: 10  
+        run: python dead_link_cleaner.py  # Yahan script ka naam call kiya hai
