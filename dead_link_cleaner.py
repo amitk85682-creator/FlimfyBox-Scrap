@@ -7,6 +7,7 @@ from playwright.async_api import async_playwright
 
 nest_asyncio.apply()
 
+# GitHub Secrets aur Matrix se variables aayenge
 DATABASE_URL = os.getenv("DATABASE_URL") 
 CHUNK_INDEX = int(os.getenv("CHUNK_INDEX", 0))
 TOTAL_CHUNKS = int(os.getenv("TOTAL_CHUNKS", 1))
@@ -67,7 +68,7 @@ async def clean_database_chunk():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     
-    # 💡 Modulo Logic: Agar 10 chunks hain, toh 0 wala job sirf un IDs ko check karega jinka last digit 0 hai, etc.
+    # Modulo Logic: Apne hisse ki IDs uthayega
     cur.execute("""
         SELECT mf.id, mf.url, m.title 
         FROM movie_files mf
@@ -82,6 +83,8 @@ async def clean_database_chunk():
     
     if not files:
         print(f"✅ Chunk {CHUNK_INDEX}: No links found to check.")
+        cur.close()
+        conn.close()
         return
 
     print(f"🚀 Chunk {CHUNK_INDEX}: Checking {len(files)} links concurrently...\n")
@@ -93,7 +96,7 @@ async def clean_database_chunk():
         context = await browser.new_context(user_agent=HEADERS["User-Agent"])
         
         async with aiohttp.ClientSession(headers=HEADERS) as session:
-            sem = asyncio.Semaphore(15) # 💡 Ek runner ek saath 15 browser tabs chalayega
+            sem = asyncio.Semaphore(15) 
             tasks = [check_link(session, context, file_id, url, title, sem, dead_ids) for file_id, url, title in files]
             await asyncio.gather(*tasks)
             
