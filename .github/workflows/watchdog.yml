@@ -2,14 +2,14 @@ name: Hourly Page 1 Watchdog
 
 on:
   schedule:
-    # Runs at 06:00, 12:00, 16:00, 21:00, and 00:00 IST
+    # Ye exact tumhare bataye hue time par chalega (IST: 06:00, 12:00, 16:00, 21:00, 00:00)
     - cron: '30 0,6,10,15,18 * * *'  
-  workflow_dispatch:
+  workflow_dispatch:     # GitHub par manual run button ke liye
 
 jobs:
   auto-updater:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40  # 40 min ki limit di hai taaki page 1 aaram se scan ho jaye
     
     steps:
       - name: Checkout Code
