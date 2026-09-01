@@ -416,9 +416,9 @@ async def master_mkvcinemas_scraper(bot_id, total_bots):
     print(f"\n✅ Bot #{bot_id} finished its assigned range successfully!", flush=True)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Matrix Scraper Bot")
-    parser.add_argument("--bot_id", type=int, default=1, help="ID of the current bot")
-    parser.add_argument("--total_bots", type=int, default=1, help="Total running bots")
+    parser = argparse.ArgumentParser(description="MKVCinemas Matrix Scraper Bot")
+    parser.add_argument("--start_page", type=int, default=1, help="Start page number")
+    parser.add_argument("--end_page", type=int, default=68, help="End page number")
     args = parser.parse_args()
 
-    asyncio.run(master_mkvcinemas_scraper(args.bot_id, args.total_bots))
+    asyncio.run(master_mkvcinemas_scraper(args.start_page, args.end_page))
