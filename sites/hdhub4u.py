@@ -285,11 +285,6 @@ class SitePlugin(BaseSitePlugin):
                     );
                     if (!isTarget) return;
                     if (btn.toLowerCase().includes('sample')) return;
-                    if (
-                        btn.toLowerCase().includes('watch') ||
-                        btn.toLowerCase().includes('play') ||
-                        par.toLowerCase().includes('watch')
-                    ) return;
 
                     // Episode / combined context detection
                     let epCtx = '';
