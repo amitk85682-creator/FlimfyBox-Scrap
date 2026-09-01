@@ -124,43 +124,49 @@ def save_movie_to_db(data_dict):
         print(f"⚠️ DB Save Error: {e}", flush=True)
 
 def get_all_movie_links_from_sitemap():
-    """Fetches all movie URLs directly from the site sitemap to bypass 90-page limitations."""
+    """Fetches all movie URLs directly from the site sitemap with proper browser headers."""
     print("📥 Fetching website sitemap...", flush=True)
     movie_links = set()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
     try:
         sitemap_url = f"{TARGET_WEBSITE}/sitemap.xml"
-        resp = requests.get(sitemap_url, timeout=20)
-        if resp.status_code != 200:
-            print("⚠️ Main sitemap.xml not found, trying post-sitemap...", flush=True)
+        resp = requests.get(sitemap_url, headers=headers, timeout=20)
+        
+        # Check if blocked or returning HTML instead of XML
+        if resp.status_code != 200 or '<html' in resp.text.lower():
+            print("⚠️ Main sitemap.xml blocked or not found, trying post-sitemap...", flush=True)
             sitemap_url = f"{TARGET_WEBSITE}/post-sitemap.xml"
-            resp = requests.get(sitemap_url, timeout=20)
+            resp = requests.get(sitemap_url, headers=headers, timeout=20)
             
-        if resp.status_code == 200:
+        if resp.status_code == 200 and '<html' not in resp.text.lower():
             root = ET.fromstring(resp.content)
-            # Handle sitemap index or standard sitemap
             namespaces = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
             
-            # Check if it's a sitemap index
             sitemaps = root.findall('ns:sitemap', namespaces)
             if sitemaps:
                 for sm in sitemaps:
                     loc = sm.find('ns:loc', namespaces).text
-                    if 'post' in loc or 'movie' in loc or 'sitemap' in loc:
+                    if loc and ('post' in loc or 'movie' in loc or 'sitemap' in loc):
                         try:
-                            sub_resp = requests.get(loc, timeout=15)
-                            if sub_resp.status_code == 200:
+                            sub_resp = requests.get(loc, headers=headers, timeout=15)
+                            if sub_resp.status_code == 200 and '<html' not in sub_resp.text.lower():
                                 sub_root = ET.fromstring(sub_resp.content)
                                 for url_elem in sub_root.findall('ns:url', namespaces):
                                     url_loc = url_elem.find('ns:loc', namespaces).text
-                                    if re.search(r'/\d{4,7}/', url_loc):
+                                    if url_loc and re.search(r'/\d{4,7}/', url_loc):
                                         movie_links.add(url_loc)
                         except:
                             pass
             else:
                 for url_elem in root.findall('ns:url', namespaces):
                     url_loc = url_elem.find('ns:loc', namespaces).text
-                    if re.search(r'/\d{4,7}/', url_loc):
+                    if url_loc and re.search(r'/\d{4,7}/', url_loc):
                         movie_links.add(url_loc)
+        else:
+            print("❌ Server returned an HTML page or blocked the sitemap request.", flush=True)
+            
         print(f"✅ Loaded {len(movie_links)} total links from Sitemap!", flush=True)
     except Exception as e:
         print(f"❌ Sitemap fetch error: {e}", flush=True)
