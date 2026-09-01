@@ -17,7 +17,7 @@ name: "🚀 Universal Scraper Cluster"
 on:
   # ── Scheduled: daily watchdog for all sites ────────────────────────
   schedule:
-    - cron: "0 0 * * *"       # Midnight UTC, every day
+    - cron: "30 0,4,6,10,14,18 * * *"       # 6AM, 10AM, 12PM, 4PM, 8PM, 12AM IST
 
   # ── Manual trigger with full control ───────────────────────────────
   workflow_dispatch:
