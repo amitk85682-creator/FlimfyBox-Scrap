@@ -10,7 +10,7 @@ on:
       end_page:
         description: 'End page number'
         required: false
-        default: '1016'
+        default: '68'
 
 jobs:
   run-bot:
@@ -26,15 +26,20 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Install System Dependencies (Xvfb)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
       - name: Install Python Packages
         run: |
+          pip install --upgrade pip
           pip install -r requirements.txt
           playwright install chromium
           playwright install-deps chromium
 
       - name: Run Scraper Bot
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           PYTHONUNBUFFERED: "1"
         run: python scraper.py --start_page ${{ github.event.inputs.start_page }} --end_page ${{ github.event.inputs.end_page }}
