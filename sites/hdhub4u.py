@@ -624,16 +624,23 @@ class SitePlugin(BaseSitePlugin):
                 "direct_links": direct_links,
             }
 
-        # Process links sequentially — each creates a heavy browser
-        # context so we avoid overwhelming the CI runner.
+        # Use a Semaphore to limit concurrent browser contexts per movie
+        # to avoid OOM crashes on the runner, but fast enough to overlap waits.
+        bypass_sem = asyncio.Semaphore(5)
+
+        async def _sem_process(raw):
+            async with bypass_sem:
+                return await _process_single(raw)
+
+        # Process links concurrently instead of sequentially
+        tasks = [_sem_process(raw) for raw in raw_links]
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
         results = []
-        for raw in raw_links:
-            try:
-                r = await _process_single(raw)
-                if r and r.get("direct_links"):
-                    results.append(r)
-            except Exception as e:
-                print(f"   ⚠️ Link bypass failed: {e}", flush=True)
-                continue
+        for r in gathered:
+            if isinstance(r, Exception):
+                print(f"   ⚠️ Link bypass failed: {r}", flush=True)
+            elif r and r.get("direct_links"):
+                results.append(r)
 
         return results
