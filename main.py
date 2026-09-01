@@ -970,7 +970,7 @@ async def run_watchdog_mode(plugin):
             flush=True,
         )
 
-        # ── Phase 3: Sequential scraping with smart verify ───────────
+        # ── Phase 3: Concurrent scraping with smart verify ───────────
         main_ctx = await browser.new_context(user_agent=USER_AGENT)
         await main_ctx.route(
             "**/*",
@@ -982,17 +982,29 @@ async def run_watchdog_mode(plugin):
         )
         sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-        for url in watchdog_urls:
+        # Process in batches just like Matrix mode for max speed
+        for i in range(0, len(watchdog_urls), BATCH_SIZE):
             if time.time() - start_time > MAX_RUN_TIME_SECONDS:
                 print("⏳ Time limit reached.", flush=True)
                 break
-            try:
-                await scrape_and_save_movie(
+                
+            batch = watchdog_urls[i : i + BATCH_SIZE]
+            batch_num = i // BATCH_SIZE + 1
+            total_batches = (len(watchdog_urls) + BATCH_SIZE - 1) // BATCH_SIZE
+            print(f"\n📦 Batch {batch_num}/{total_batches} ({len(batch)} URLs) processing concurrently...", flush=True)
+            
+            tasks = [
+                scrape_and_save_movie(
                     url, plugin, browser, main_ctx, sem, is_watchdog=True
                 )
-            except Exception as e:
-                print(f"   ❌ Unhandled error for {url}: {e}", flush=True)
-                continue
+                for url in batch
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Log any unhandled exceptions
+            for url, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    print(f"   ❌ Unhandled error for {url}: {result}", flush=True)
 
         await main_ctx.close()
         await browser.close()
