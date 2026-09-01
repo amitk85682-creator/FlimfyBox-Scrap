@@ -430,6 +430,8 @@ def save_movie_to_db(data_dict):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        # Prevent infinite hangs if a row is locked by another dangling bot
+        cur.execute("SET statement_timeout = 30000;")
 
         tmdb = data_dict.get("tmdb_data") or {}
 
@@ -802,7 +804,7 @@ async def scrape_and_save_movie(
 
         # ── Step 5: TMDB enrichment ──────────────────────────────────
         fixed_data = fix_movie_details(scraped_data, movie_url=movie_url)
-        tmdb_data = get_tmdb_details(fixed_data)
+        tmdb_data = await asyncio.to_thread(get_tmdb_details, fixed_data)
 
         # ── Step 6: DB upsert ────────────────────────────────────────
         db_payload = {
@@ -821,7 +823,7 @@ async def scrape_and_save_movie(
             "bypassed_links": bypassed_links,
         }
 
-        save_movie_to_db(db_payload)
+        await asyncio.to_thread(save_movie_to_db, db_payload)
 
 
 # =====================================================================
