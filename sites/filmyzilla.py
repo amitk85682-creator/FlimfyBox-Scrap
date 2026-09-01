@@ -33,7 +33,7 @@ class SitePlugin(BaseSitePlugin):
     # ==================================================================
     # 1. URL DISCOVERY — XML Sitemap
     # ==================================================================
-    async def get_all_urls(self, context=None):
+    async def get_all_urls(self, context=None, watchdog_mode=False):
         """
         Fetch all movie URLs from the XML sitemap.
         Does NOT need a browser context — uses requests internally.

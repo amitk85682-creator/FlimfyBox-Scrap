@@ -39,7 +39,7 @@ class SitePlugin(BaseSitePlugin):
     # ==================================================================
     # 1. URL DISCOVERY — Pagination-based crawling
     # ==================================================================
-    async def get_all_urls(self, context=None):
+    async def get_all_urls(self, context=None, watchdog_mode=False):
         """
         Crawl site pages sequentially and extract movie post links.
         Requires a Playwright BrowserContext for JS-rendered pages.
@@ -51,8 +51,11 @@ class SitePlugin(BaseSitePlugin):
             )
             return []
 
+        # Optimization: In watchdog mode, only crawl the first 2 pages.
+        max_pages = 2 if watchdog_mode else self.MAX_DISCOVERY_PAGES
+
         print(
-            f"📥 Crawling {self.SITE_NAME} pages for URLs...",
+            f"📥 Crawling {self.SITE_NAME} pages for URLs (Max Pages: {max_pages})...",
             flush=True,
         )
 
@@ -97,7 +100,7 @@ class SitePlugin(BaseSitePlugin):
         page_num = 1
         consecutive_empty = 0
 
-        while page_num <= self.MAX_DISCOVERY_PAGES:
+        while page_num <= max_pages:
             url = (
                 f"{self.TARGET_WEBSITE}/page/{page_num}/"
                 if page_num > 1

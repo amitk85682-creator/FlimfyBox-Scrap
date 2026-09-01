@@ -33,7 +33,7 @@ class SitePlugin(BaseSitePlugin):
     # ==================================================================
     # 1. URL DISCOVERY
     # ==================================================================
-    async def get_all_urls(self, context=None):
+    async def get_all_urls(self, context=None, watchdog_mode=False):
         """
         TODO: Implement URL discovery for MKVCinemas.
 

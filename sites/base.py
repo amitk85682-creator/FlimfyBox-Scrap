@@ -33,7 +33,7 @@ class BaseSitePlugin:
     # ------------------------------------------------------------------
     # 1. URL DISCOVERY
     # ------------------------------------------------------------------
-    async def get_all_urls(self, context=None):
+    async def get_all_urls(self, context=None, watchdog_mode=False):
         """
         Return a list of ALL movie/post URLs from the site.
 
@@ -41,6 +41,8 @@ class BaseSitePlugin:
             context: An optional Playwright BrowserContext that the plugin
                      can use for JS-rendered page crawling. Plugins that
                      use XML sitemaps via `requests` may ignore this.
+            watchdog_mode: If True, the plugin should optimize and only
+                     fetch enough pages/data to satisfy WATCHDOG_LIMIT.
 
         Returns:
             list[str]: Ordered list of movie URLs. Most-recent items should

@@ -953,7 +953,7 @@ async def run_watchdog_mode(plugin):
         # ── Phase 1: URL Discovery ───────────────────────────────────
         print("\n📥 Discovering latest URLs...", flush=True)
         discovery_ctx = await browser.new_context(user_agent=USER_AGENT)
-        all_urls = await plugin.get_all_urls(discovery_ctx)
+        all_urls = await plugin.get_all_urls(discovery_ctx, watchdog_mode=True)
         await discovery_ctx.close()
 
         if not all_urls:
