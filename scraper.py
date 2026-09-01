@@ -1,6 +1,3 @@
-# =====================================================================
-# scraper.py (GitHub Ready Matrix Version)
-# =====================================================================
 import asyncio
 import os
 import re
@@ -11,6 +8,7 @@ import json
 import time
 import argparse
 import psycopg2
+import xml.etree.ElementTree as ET
 from playwright.async_api import async_playwright
 from pyvirtualdisplay import Display
 
@@ -124,6 +122,50 @@ def save_movie_to_db(data_dict):
         conn.close()
     except Exception as e:
         print(f"⚠️ DB Save Error: {e}", flush=True)
+
+def get_all_movie_links_from_sitemap():
+    """Fetches all movie URLs directly from the site sitemap to bypass 90-page limitations."""
+    print("📥 Fetching website sitemap...", flush=True)
+    movie_links = set()
+    try:
+        sitemap_url = f"{TARGET_WEBSITE}/sitemap.xml"
+        resp = requests.get(sitemap_url, timeout=20)
+        if resp.status_code != 200:
+            print("⚠️ Main sitemap.xml not found, trying post-sitemap...", flush=True)
+            sitemap_url = f"{TARGET_WEBSITE}/post-sitemap.xml"
+            resp = requests.get(sitemap_url, timeout=20)
+            
+        if resp.status_code == 200:
+            root = ET.fromstring(resp.content)
+            # Handle sitemap index or standard sitemap
+            namespaces = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+            
+            # Check if it's a sitemap index
+            sitemaps = root.findall('ns:sitemap', namespaces)
+            if sitemaps:
+                for sm in sitemaps:
+                    loc = sm.find('ns:loc', namespaces).text
+                    if 'post' in loc or 'movie' in loc or 'sitemap' in loc:
+                        try:
+                            sub_resp = requests.get(loc, timeout=15)
+                            if sub_resp.status_code == 200:
+                                sub_root = ET.fromstring(sub_resp.content)
+                                for url_elem in sub_root.findall('ns:url', namespaces):
+                                    url_loc = url_elem.find('ns:loc', namespaces).text
+                                    if re.search(r'/\d{4,7}/', url_loc):
+                                        movie_links.add(url_loc)
+                        except:
+                            pass
+            else:
+                for url_elem in root.findall('ns:url', namespaces):
+                    url_loc = url_elem.find('ns:loc', namespaces).text
+                    if re.search(r'/\d{4,7}/', url_loc):
+                        movie_links.add(url_loc)
+        print(f"✅ Loaded {len(movie_links)} total links from Sitemap!", flush=True)
+    except Exception as e:
+        print(f"❌ Sitemap fetch error: {e}", flush=True)
+    
+    return list(movie_links)
 
 async def bypass_hubcloud_chain(context, hubcloud_url):
     page = await context.new_page()
@@ -347,8 +389,22 @@ async def scrape_and_save_movie(movie_link, main_context, sem):
 
 async def master_mkvcinemas_scraper(bot_id, total_bots):
     print("=" * 60, flush=True)
-    print(f"🚀 MATRIX BOT #{bot_id} of {total_bots} STARTED", flush=True)
+    print(f"🚀 MATRIX BOT #{bot_id} of {total_bots} (Sitemap Mode) STARTED", flush=True)
     print("=" * 60, flush=True)
+
+    # Fetch all URLs from Sitemap
+    all_links = get_all_movie_links_from_sitemap()
+    if not all_links:
+        print("❌ No links retrieved from sitemap. Exiting.", flush=True)
+        return
+
+    # Split links among the 15 bots
+    chunk_size = max(1, len(all_links) // total_bots)
+    start_idx = (bot_id - 1) * chunk_size
+    end_idx = len(all_links) if bot_id == total_bots else start_idx + chunk_size
+    my_links = all_links[start_idx:end_idx]
+
+    print(f"📋 Bot #{bot_id} assigned {len(my_links)} movies out of {len(all_links)} total.", flush=True)
 
     display = Display(visible=0, size=(1920, 1080))
     display.start()
@@ -362,63 +418,18 @@ async def master_mkvcinemas_scraper(bot_id, total_bots):
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         )
         
-        page = await main_context.new_page()
         sem = asyncio.Semaphore(10)
-
-        # Distribute work cleanly across 15 bots (assuming ~90 total pages)
-        total_pages = 90
-        pages_per_bot = max(1, total_pages // total_bots)
-        start_page = ((bot_id - 1) * pages_per_bot) + 1
-        end_page = total_pages if bot_id == total_bots else start_page + pages_per_bot - 1
-
-        page_num = start_page
-        while page_num <= end_page:
-            current_page_url = f"{TARGET_WEBSITE}/page/{page_num}/" if page_num > 1 else f"{TARGET_WEBSITE}/"
-            print(f"\n🌐 Bot #{bot_id} Scanning Page {page_num} (Range {start_page}-{end_page}): {current_page_url}", flush=True)
-            
-            try:
-                response = await page.goto(current_page_url, timeout=45000, wait_until="domcontentloaded")
-                if response and response.status == 404:
-                    break
-            except Exception as e:
-                page_num += 1
-                continue
-
-            movie_links = await page.evaluate(r'''() => {
-                let links = Array.from(document.querySelectorAll('a'));
-                let unique = [];
-                let urls = new Set();
-                let movieUrlRegex = /\/\d{4,7}\/[^\/]+\/?$/i;
-
-                links.forEach(a => {
-                    let href = a.href;
-                    if (href.includes('mkvcinemas') && movieUrlRegex.test(href)) {
-                        if (!urls.has(href)) {
-                            urls.add(href);
-                            unique.push(href);
-                        }
-                    }
-                });
-                return unique;
-            }''')
-
-            if not movie_links:
-                page_num += 1
-                continue
-
-            tasks = [scrape_and_save_movie(m_link, main_context, sem) for m_link in movie_links]
-            await asyncio.gather(*tasks)
-
-            page_num += 1
+        tasks = [scrape_and_save_movie(m_link, main_context, sem) for m_link in my_links]
+        await asyncio.gather(*tasks)
 
         await browser.close()
     display.stop()
-    print(f"\n✅ Bot #{bot_id} finished its assigned range successfully!", flush=True)
+    print(f"\n✅ Bot #{bot_id} finished its assigned sitemap chunk successfully!", flush=True)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MKVCinemas Matrix Scraper Bot")
-    parser.add_argument("--start_page", type=int, default=1, help="Start page number")
-    parser.add_argument("--end_page", type=int, default=68, help="End page number")
+    parser = argparse.ArgumentParser(description="Matrix Sitemap Scraper Bot")
+    parser.add_argument("--bot_id", type=int, default=1, help="ID of the current bot")
+    parser.add_argument("--total_bots", type=int, default=1, help="Total running bots")
     args = parser.parse_args()
 
-    asyncio.run(master_mkvcinemas_scraper(args.start_page, args.end_page))
+    asyncio.run(master_mkvcinemas_scraper(args.bot_id, args.total_bots))
