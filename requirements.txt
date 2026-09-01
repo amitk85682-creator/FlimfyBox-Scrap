@@ -3,3 +3,4 @@ nest_asyncio
 requests
 psycopg2-binary
 pyvirtualdisplay
+lxml

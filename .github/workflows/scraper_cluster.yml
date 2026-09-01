@@ -1,0 +1,137 @@
+# ======================================================================
+# 🚀 Universal Scraper Cluster — GitHub Actions Workflow
+# ======================================================================
+# Single workflow that replaces ALL per-site workflows.
+#
+# Triggers:
+#   • Cron   : Daily midnight UTC → Watchdog mode for all sites
+#   • Manual : Choose mode (matrix/watchdog), site, and bot count
+#
+# Architecture:
+#   1. "setup" job computes the dynamic matrix from inputs
+#   2. "scrape" job fans out across site × bot_id combinations
+# ======================================================================
+
+name: "🚀 Universal Scraper Cluster"
+
+on:
+  # ── Scheduled: daily watchdog for all sites ────────────────────────
+  schedule:
+    - cron: "0 0 * * *"       # Midnight UTC, every day
+
+  # ── Manual trigger with full control ───────────────────────────────
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Execution mode"
+        required: true
+        default: "watchdog"
+        type: choice
+        options:
+          - watchdog
+          - matrix
+      site:
+        description: "Target site (or 'all')"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - filmyzilla
+          - hdhub4u
+          - mkvcinemas
+      total_bots:
+        description: "Parallel bots per site (matrix mode only)"
+        required: false
+        default: "5"
+        type: string
+
+jobs:
+  # ================================================================
+  # SETUP: Compute dynamic matrix from inputs / schedule
+  # ================================================================
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      site_matrix: ${{ steps.compute.outputs.site_matrix }}
+      bot_matrix:  ${{ steps.compute.outputs.bot_matrix }}
+      mode:        ${{ steps.compute.outputs.mode }}
+      total_bots:  ${{ steps.compute.outputs.total_bots }}
+
+    steps:
+      - name: Compute matrix dimensions
+        id: compute
+        run: |
+          # ── Determine mode ─────────────────────────────────────────
+          if [ "${{ github.event_name }}" == "schedule" ]; then
+            MODE="watchdog"
+          else
+            MODE="${{ github.event.inputs.mode }}"
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+          # ── Determine site list ────────────────────────────────────
+          SITE="${{ github.event.inputs.site || 'all' }}"
+          if [ "$SITE" == "all" ]; then
+            echo 'site_matrix=["filmyzilla","hdhub4u","mkvcinemas"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "site_matrix=[\"$SITE\"]" >> "$GITHUB_OUTPUT"
+          fi
+
+          # ── Determine bot IDs ──────────────────────────────────────
+          TOTAL="${{ github.event.inputs.total_bots || '5' }}"
+          echo "total_bots=$TOTAL" >> "$GITHUB_OUTPUT"
+
+          if [ "$MODE" == "watchdog" ]; then
+            # Watchdog only needs 1 bot per site
+            echo 'bot_matrix=[1]' >> "$GITHUB_OUTPUT"
+          else
+            # Matrix mode: generate [1, 2, ..., N]
+            BOT_LIST=$(python3 -c "import json; print(json.dumps(list(range(1, int('$TOTAL')+1))))")
+            echo "bot_matrix=$BOT_LIST" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ================================================================
+  # SCRAPE: Fan out across site × bot_id
+  # ================================================================
+  scrape:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 360     # 6-hour GitHub Actions limit
+
+    strategy:
+      fail-fast: false       # One site/bot failure must NOT kill others
+      matrix:
+        site:   ${{ fromJSON(needs.setup.outputs.site_matrix) }}
+        bot_id: ${{ fromJSON(needs.setup.outputs.bot_matrix) }}
+
+    steps:
+      # ── Checkout ─────────────────────────────────────────────────
+      - name: "📥 Checkout Code"
+        uses: actions/checkout@v4
+
+      # ── Python ───────────────────────────────────────────────────
+      - name: "🐍 Setup Python 3.11"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── Dependencies ─────────────────────────────────────────────
+      - name: "📦 Install Dependencies"
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      # ── Run ──────────────────────────────────────────────────────
+      - name: "🚀 Run ${{ needs.setup.outputs.mode }} — ${{ matrix.site }} (Bot ${{ matrix.bot_id }})"
+        env:
+          DATABASE_URL:    ${{ secrets.DATABASE_URL }}
+          TMDB_API_KEY:    ${{ secrets.TMDB_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python main.py \
+            --site ${{ matrix.site }} \
+            --mode ${{ needs.setup.outputs.mode }} \
+            --bot_id ${{ matrix.bot_id }} \
+            --total_bots ${{ needs.setup.outputs.total_bots }}
