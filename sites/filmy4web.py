@@ -156,12 +156,9 @@ class SitePlugin(BaseSitePlugin):
                 let dm = fullText.match(/(?:Description|Storyline)\s*[:-]\s*([^\n]+)/i);
                 if (dm) details.Description = dm[1].trim();
                 
-                // Quality Links: Find the /download page URL
-                let links = Array.from(document.querySelectorAll('a'));
-                let dlLink = links.find(a => a.href.includes('/download'));
-                if (dlLink) {
-                    details.download_page_url = dlLink.href;
-                }
+                // Quality Links: Direct append /download (robust fallback)
+                let currentUrl = window.location.href;
+                details.download_page_url = currentUrl.endsWith('/') ? currentUrl + 'download' : currentUrl + '/download';
                 
                 return details;
             }""")
@@ -174,7 +171,7 @@ class SitePlugin(BaseSitePlugin):
             if dl_url:
                 dl_page = await page.context.new_page()
                 try:
-                    await dl_page.goto(dl_url, timeout=45000, wait_until="domcontentloaded")
+                    await dl_page.goto(dl_url, timeout=60000, wait_until="domcontentloaded")
                     raw_links = await dl_page.evaluate(r"""() => {
                         let qLinks = [];
                         let as = Array.from(document.querySelectorAll('a'));
@@ -213,7 +210,7 @@ class SitePlugin(BaseSitePlugin):
             page = await context.new_page()
             servers = []
             try:
-                await page.goto(item["url"], timeout=45000, wait_until="domcontentloaded")
+                await page.goto(item["url"], timeout=60000, wait_until="domcontentloaded")
                 servers = await page.evaluate(r"""() => {
                     let out = [];
                     let as = Array.from(document.querySelectorAll('a'));
