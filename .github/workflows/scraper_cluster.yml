@@ -15,9 +15,10 @@
 name: "🚀 Universal Scraper Cluster"
 
 on:
-  # ── Scheduled: daily watchdog for all sites ────────────────────────
+  # ── Scheduled: daily watchdog for all sites ──────────────────────────────────
   schedule:
     - cron: "30 0,4,6,10,14,18 * * *"       # 6AM, 10AM, 12PM, 4PM, 8PM, 12AM IST
+    - cron: "0 2 * * 0"                      # Weekly Sunday 2AM UTC — full link-hash refresh
 
   # ── Manual trigger with full control ───────────────────────────────
   workflow_dispatch:
@@ -45,6 +46,11 @@ on:
         required: false
         default: "5"
         type: string
+      force_refresh:
+        description: "Force re-scrape all URLs even if already in scraped_urls"
+        required: false
+        default: "false"
+        type: boolean
 
 jobs:
   # ================================================================
@@ -53,22 +59,27 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      site_matrix: ${{ steps.compute.outputs.site_matrix }}
-      bot_matrix:  ${{ steps.compute.outputs.bot_matrix }}
-      mode:        ${{ steps.compute.outputs.mode }}
-      total_bots:  ${{ steps.compute.outputs.total_bots }}
+      site_matrix:   ${{ steps.compute.outputs.site_matrix }}
+      bot_matrix:    ${{ steps.compute.outputs.bot_matrix }}
+      mode:          ${{ steps.compute.outputs.mode }}
+      total_bots:    ${{ steps.compute.outputs.total_bots }}
+      force_refresh: ${{ steps.compute.outputs.force_refresh }}
 
     steps:
       - name: Compute matrix dimensions
         id: compute
         run: |
-          # ── Determine mode ─────────────────────────────────────────
+          # ── Determine mode ────────────────────────────────────────────
           if [ "${{ github.event_name }}" == "schedule" ]; then
             MODE="watchdog"
           else
             MODE="${{ github.event.inputs.mode }}"
           fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+
+          # ── Determine force_refresh flag ──────────────────────────────
+          FORCE="${{ github.event.inputs.force_refresh || 'false' }}"
+          echo "force_refresh=$FORCE" >> "$GITHUB_OUTPUT"
 
           # ── Determine site list ────────────────────────────────────
           SITE="${{ github.event.inputs.site || 'all' }}"
@@ -128,6 +139,7 @@ jobs:
         env:
           DATABASE_URL:    ${{ secrets.DATABASE_URL }}
           TMDB_API_KEY:    ${{ secrets.TMDB_API_KEY }}
+          FORCE_REFRESH:   ${{ needs.setup.outputs.force_refresh }}
           PYTHONUNBUFFERED: "1"
         run: |
           python main.py \

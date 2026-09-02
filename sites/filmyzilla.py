@@ -40,6 +40,7 @@ class SitePlugin(BaseSitePlugin):
         """
         print(f"📥 Fetching {self.SITE_NAME} sitemap...", flush=True)
         movie_links = []
+        urls_with_meta = []   # list of (lastmod_str, url) for newest-first sort
 
         try:
             # Try the main sitemap index first
@@ -91,7 +92,9 @@ class SitePlugin(BaseSitePlugin):
                                     and url_loc.text
                                     and "/movie/" in url_loc.text
                                 ):
-                                    urls_found.add(url_loc.text)
+                                    lm_elem = url_elem.find("ns:lastmod", ns)
+                                    lm = lm_elem.text if lm_elem is not None else ""
+                                    urls_with_meta.append((lm, url_loc.text))
                     except Exception as e:
                         print(
                             f"   ⚠️ Sub-sitemap error ({loc}): {e}",
@@ -106,9 +109,13 @@ class SitePlugin(BaseSitePlugin):
                         and url_loc.text
                         and "/movie/" in url_loc.text
                     ):
-                        urls_found.add(url_loc.text)
+                        lm_elem = url_elem.find("ns:lastmod", ns)
+                        lm = lm_elem.text if lm_elem is not None else ""
+                        urls_with_meta.append((lm, url_loc.text))
 
-            movie_links = list(urls_found)
+            # Sort newest first (ISO date strings sort correctly lexicographically)
+            urls_with_meta.sort(reverse=True)
+            movie_links = [url for _, url in urls_with_meta]
             print(
                 f"✅ Discovered {len(movie_links)} movie URLs from sitemap!",
                 flush=True,
