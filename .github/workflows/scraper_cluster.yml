@@ -41,6 +41,7 @@ on:
           - filmyzilla
           - hdhub4u
           - mkvcinemas
+          - filmy4web
       total_bots:
         description: "Parallel bots per site (matrix mode only)"
         required: false
