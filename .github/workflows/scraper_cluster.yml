@@ -41,7 +41,6 @@ on:
           - filmyzilla
           - hdhub4u
           - mkvcinemas
-          - filmy4web
       total_bots:
         description: "Parallel bots per site (matrix mode only)"
         required: false
@@ -141,6 +140,7 @@ jobs:
           DATABASE_URL:    ${{ secrets.DATABASE_URL }}
           TMDB_API_KEY:    ${{ secrets.TMDB_API_KEY }}
           FORCE_REFRESH:   ${{ needs.setup.outputs.force_refresh }}
+          DB_POOL_SIZE:    "3"
           PYTHONUNBUFFERED: "1"
         run: |
           python main.py \

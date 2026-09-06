@@ -31,6 +31,8 @@ import urllib.parse
 import hashlib
 import requests
 import psycopg2
+from psycopg2 import pool as psycopg2_pool
+from psycopg2.extras import execute_values
 import nest_asyncio
 from playwright.async_api import async_playwright
 
@@ -60,33 +62,89 @@ USER_AGENT = (
     "Chrome/122.0.0.0 Safari/537.36"
 )
 
+# ── Connection pool size ─────────────────────────────────────────────
+# Per-process pool. Default=3 is safe for the current GitHub Actions
+# matrix of up to 15 parallel processes (3 sites × 5 bots).
+#
+# Connection budget (worst case, GitHub Actions matrix mode):
+#   15 processes × DB_POOL_SIZE(3) = 45 scraper connections
+#   + ~15 Supabase infrastructure connections
+#   = ~60  (matches Supavisor hard limit of 60)
+#
+# For a single VPS worker: set DB_POOL_SIZE=10 or higher.
+# NEVER increase this without also reducing matrix concurrency.
+DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "3"))
+
 
 # =====================================================================
-# DATABASE HELPERS
+# DATABASE CONNECTION POOL
 # =====================================================================
-def get_db_connection():
-    """Create a new PostgreSQL connection using DATABASE_URL env var."""
-    if not DATABASE_URL:
-        raise EnvironmentError(
-            "❌ DATABASE_URL environment variable is not set. "
-            "Set it to your Supabase/PostgreSQL connection string."
+_db_pool = None
+
+
+def _get_pool():
+    """
+    Return the process-level ThreadedConnectionPool, creating it on first
+    call.  Each Python process (GitHub Actions bot, VPS worker) has its
+    own pool of size DB_POOL_SIZE.
+    """
+    global _db_pool
+    if _db_pool is None or _db_pool.closed:
+        if not DATABASE_URL:
+            raise EnvironmentError(
+                "DATABASE_URL environment variable is not set. "
+                "Set it to your Supabase/PostgreSQL connection string."
+            )
+        _db_pool = psycopg2_pool.ThreadedConnectionPool(
+            minconn=1,
+            maxconn=DB_POOL_SIZE,
+            dsn=DATABASE_URL,
+            connect_timeout=10,
         )
-    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    return _db_pool
+
+
+def get_db_connection():
+    """Borrow a connection from the process-level pool."""
+    return _get_pool().getconn()
+
+
+def release_db_connection(conn):
+    """Return a borrowed connection to the pool (does NOT close it)."""
+    try:
+        _get_pool().putconn(conn)
+    except Exception:
+        # Pool may have been closed during shutdown — just discard.
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def shutdown_db_pool():
+    """Close all pooled connections.  Call once at process exit."""
+    global _db_pool
+    if _db_pool and not _db_pool.closed:
+        _db_pool.closeall()
+    _db_pool = None
 
 
 def check_movie_in_db(url):
     """Return True if this movie page URL already exists in the DB."""
+    conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT url FROM movies WHERE url = %s;", (url,))
         result = cur.fetchone()
         cur.close()
-        conn.close()
         return bool(result)
     except Exception as e:
         print(f"   ⚠️ DB Check Error: {e}", flush=True)
         return False
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 
 def get_existing_file_urls(movie_url):
@@ -94,6 +152,7 @@ def get_existing_file_urls(movie_url):
     For watchdog smart-verify: return the movie's DB id, title,
     and set of all existing direct download URLs.
     """
+    conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -104,7 +163,6 @@ def get_existing_file_urls(movie_url):
         row = cur.fetchone()
         if not row:
             cur.close()
-            conn.close()
             return None, None, set()
 
         movie_id, db_title = row
@@ -114,11 +172,13 @@ def get_existing_file_urls(movie_url):
         )
         existing_urls = {r[0] for r in cur.fetchall() if r[0]}
         cur.close()
-        conn.close()
         return movie_id, db_title, existing_urls
     except Exception as e:
         print(f"   ⚠️ DB Verify Error: {e}", flush=True)
         return None, None, set()
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 
 # =====================================================================
@@ -129,6 +189,7 @@ def initialize_db():
     Auto-create scraper infrastructure tables on startup.
     Uses CREATE TABLE IF NOT EXISTS — safe to run on every boot.
     """
+    conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -162,15 +223,39 @@ def initialize_db():
             );
         """)
 
+        # Crawl run observability — one row per scraper invocation
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS crawl_runs (
+                id              BIGSERIAL PRIMARY KEY,
+                site_name       TEXT NOT NULL,
+                run_mode        TEXT NOT NULL,
+                bot_id          INT  DEFAULT 1,
+                total_bots      INT  DEFAULT 1,
+                started_at      TIMESTAMPTZ DEFAULT NOW(),
+                finished_at     TIMESTAMPTZ,
+                status          TEXT DEFAULT 'running',
+                urls_discovered INT  DEFAULT 0,
+                urls_processed  INT  DEFAULT 0,
+                urls_inserted   INT  DEFAULT 0,
+                urls_updated    INT  DEFAULT 0,
+                urls_skipped    INT  DEFAULT 0,
+                urls_failed     INT  DEFAULT 0,
+                duration_secs   FLOAT,
+                error_message   TEXT
+            );
+        """)
+
         conn.commit()
         cur.close()
-        conn.close()
         print(
-            "✅ DB initialized — scraped_urls + scraper_state tables ready.",
+            "✅ DB initialized — scraped_urls + scraper_state + crawl_runs tables ready.",
             flush=True,
         )
     except Exception as e:
         print(f"⚠️ DB init warning (tables may already exist): {e}", flush=True)
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 
 def compute_link_hash(bypassed_links):
@@ -211,6 +296,7 @@ def get_already_scraped_urls_bulk(site_name, url_list, chunk_size=10_000):
     result = {}
     if not url_list:
         return result
+    conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -224,19 +310,22 @@ def get_already_scraped_urls_bulk(site_name, url_list, chunk_size=10_000):
             for row in cur.fetchall():
                 result[row[0]] = row[1]
         cur.close()
-        conn.close()
     except Exception as e:
         print(f"⚠️ Bulk URL check error: {e}", flush=True)
+    finally:
+        if conn:
+            release_db_connection(conn)
     return result
 
 
 def mark_url_scraped(url, site_name, link_hash=None, skip_reason="ok"):
     """
     Upsert a URL into scraped_urls after processing.
-      skip_reason = 'ok'       → successfully saved to DB
-      skip_reason = 'no_links' → page had no download links
-      skip_reason = 'dead'     → page returned 404 / load error
+      skip_reason = 'ok'       -> successfully saved to DB
+      skip_reason = 'no_links' -> page had no download links
+      skip_reason = 'dead'     -> page returned 404 / load error
     """
+    conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -254,15 +343,18 @@ def mark_url_scraped(url, site_name, link_hash=None, skip_reason="ok"):
         )
         conn.commit()
         cur.close()
-        conn.close()
     except Exception as e:
         print(f"⚠️ mark_url_scraped error: {e}", flush=True)
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 
 def save_progress(
     site_name, bot_id, total_bots, mode, urls_done, urls_total, sitemap_hash
 ):
     """Upsert current scraping progress into scraper_state (monitoring + resume)."""
+    conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -286,9 +378,11 @@ def save_progress(
         )
         conn.commit()
         cur.close()
-        conn.close()
     except Exception as e:
         print(f"⚠️ save_progress error: {e}", flush=True)
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 
 def load_progress(site_name, bot_id, total_bots, mode, sitemap_hash):
@@ -296,8 +390,9 @@ def load_progress(site_name, bot_id, total_bots, mode, sitemap_hash):
     Load previous scraping state for crash-resume awareness.
 
     Returns urls_done from the last run if the sitemap hash still matches,
-    else 0 (sitemap changed → full fresh pass, bulk pre-filter handles skips).
+    else 0 (sitemap changed -> full fresh pass, bulk pre-filter handles skips).
     """
+    conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -312,13 +407,12 @@ def load_progress(site_name, bot_id, total_bots, mode, sitemap_hash):
         )
         row = cur.fetchone()
         cur.close()
-        conn.close()
         if not row:
             return 0
         saved_hash = row[1]
         if saved_hash != sitemap_hash:
             print(
-                "🔄 Sitemap changed (hash mismatch) — "
+                "Sitemap changed (hash mismatch) — "
                 "scraper_state reset for this run.",
                 flush=True,
             )
@@ -326,7 +420,7 @@ def load_progress(site_name, bot_id, total_bots, mode, sitemap_hash):
         prev_done = row[0] or 0
         if prev_done > 0:
             print(
-                f"♻️  Previous run found: {prev_done} URLs already processed "
+                f"Previous run found: {prev_done} URLs already processed "
                 f"(as of {row[2]}). Bulk pre-filter will skip them.",
                 flush=True,
             )
@@ -334,6 +428,86 @@ def load_progress(site_name, bot_id, total_bots, mode, sitemap_hash):
     except Exception as e:
         print(f"⚠️ load_progress error: {e}", flush=True)
         return 0
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+
+# =====================================================================
+# CRAWL RUN TRACKING — Observability helpers
+# =====================================================================
+def create_crawl_run(site_name, run_mode, bot_id=1, total_bots=1):
+    """Insert a new crawl_runs row and return its id."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO crawl_runs (site_name, run_mode, bot_id, total_bots)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id;
+            """,
+            (site_name, run_mode, bot_id, total_bots),
+        )
+        run_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        return run_id
+    except Exception as e:
+        print(f"⚠️ create_crawl_run error: {e}", flush=True)
+        return None
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+
+def finish_crawl_run(run_id, status, counters, error_message=None):
+    """
+    Finalize a crawl_runs row.
+    counters = dict with keys: discovered, processed, inserted,
+                               updated, skipped, failed
+    """
+    if run_id is None:
+        return
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE crawl_runs SET
+                finished_at     = NOW(),
+                status          = %s,
+                urls_discovered = %s,
+                urls_processed  = %s,
+                urls_inserted   = %s,
+                urls_updated    = %s,
+                urls_skipped    = %s,
+                urls_failed     = %s,
+                duration_secs   = EXTRACT(EPOCH FROM (NOW() - started_at)),
+                error_message   = %s
+            WHERE id = %s;
+            """,
+            (
+                status,
+                counters.get("discovered", 0),
+                counters.get("processed", 0),
+                counters.get("inserted", 0),
+                counters.get("updated", 0),
+                counters.get("skipped", 0),
+                counters.get("failed", 0),
+                error_message,
+                run_id,
+            ),
+        )
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        print(f"⚠️ finish_crawl_run error: {e}", flush=True)
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 
 # =====================================================================
@@ -627,6 +801,7 @@ def get_tmdb_details(fixed_data):
 
 
 # =====================================================================
+# =====================================================================
 # DATABASE UPSERT — Movies + Movie Files
 # =====================================================================
 def save_movie_to_db(data_dict):
@@ -666,7 +841,7 @@ def save_movie_to_db(data_dict):
             title = re.sub(r"\s+", " ", title).strip()
 
         if not title:
-            print("   ⚠️ No valid title. Skipping DB save.", flush=True)
+            print("   Warning: No valid title. Skipping DB save.", flush=True)
             return
 
         # ── Merge page-scraped + TMDB metadata ───────────────────────
@@ -681,22 +856,22 @@ def save_movie_to_db(data_dict):
             else ""
         )
 
-        page_genre = data_dict.get("Genre", "N/A")
+        page_genre  = data_dict.get("Genre", "N/A")
         page_rating = data_dict.get("IMDb", "N/A")
-        page_cast = data_dict.get("Stars", "N/A")
-        page_lang = data_dict.get("Language", "N/A")
-        page_desc = data_dict.get("Description", "N/A")
+        page_cast   = data_dict.get("Stars", "N/A")
+        page_lang   = data_dict.get("Language", "N/A")
+        page_desc   = data_dict.get("Description", "N/A")
 
         # Page data takes priority, TMDB as fallback
-        genre_str = page_genre if page_genre != "N/A" else tmdb.get("Genre", "N/A")
+        genre_str  = page_genre  if page_genre  != "N/A" else tmdb.get("Genre", "N/A")
         rating_str = page_rating if page_rating != "N/A" else tmdb.get("TMDb_Rating", "N/A")
-        cast_str = page_cast if page_cast != "N/A" else tmdb.get("Cast", "N/A")
-        plot_str = page_desc if page_desc != "N/A" else tmdb.get("Description", "N/A")
-        lang_str = page_lang if page_lang != "N/A" else "Hindi"
+        cast_str   = page_cast   if page_cast   != "N/A" else tmdb.get("Cast", "N/A")
+        plot_str   = page_desc   if page_desc   != "N/A" else tmdb.get("Description", "N/A")
+        lang_str   = page_lang   if page_lang   != "N/A" else "Hindi"
 
         imdb_id_real = tmdb.get("imdb_id")
         seasons_json = tmdb.get("seasons_data", {})
-        
+
         if data_dict.get("Type") == "Hot Web Series":
             final_category = "Hot Web Series"
         else:
@@ -720,8 +895,8 @@ def save_movie_to_db(data_dict):
             cur.execute(
                 """
                 UPDATE movies SET
-                    url        = %s,
-                    poster_url = COALESCE(NULLIF(poster_url, ''), %s),
+                    url          = %s,
+                    poster_url   = COALESCE(NULLIF(poster_url, ''), %s),
                     seasons_data = %s
                 WHERE id = %s
                 """,
@@ -776,25 +951,31 @@ def save_movie_to_db(data_dict):
         if not movie_id:
             conn.commit()
             cur.close()
-            conn.close()
             return
 
-        # ── UPSERT: movie_files table ────────────────────────────────
+        # ── UPSERT: movie_files table (batch) ────────────────────────
+        # All quality/episode/language detection logic is unchanged.
+        # Records are collected first, then written in a single batch
+        # INSERT ... ON CONFLICT using the existing unique constraint:
+        #   unique_movie_quality_server (movie_id, quality, server_name, extra_info)
         default_season = data_dict.get("Default_Season") or 1
         bypassed_links = data_dict.get("bypassed_links", [])
 
+        file_records = []  # (movie_id, quality, srv_name, srv_url, file_size, languages, ep_str)
+
         for link_group in bypassed_links:
-            raw_quality = link_group.get("quality", "Unknown")
-            file_size = link_group.get("size", "")
+            raw_quality  = link_group.get("quality", "Unknown")
+            file_size    = link_group.get("size", "")
             direct_links = link_group.get("direct_links", [])
 
             for server in direct_links:
                 srv_name_raw = server.get("server_name", "Download Server")
-                srv_url = server.get("url", "").strip()
+                srv_url      = server.get("url", "").strip()
                 if not srv_url:
                     continue
 
                 # ── Smart quality / episode / language detection ──────
+                # (logic unchanged from original)
                 decoded_url = urllib.parse.unquote(srv_url)
                 fn_match = re.search(
                     r'filename=["\']?(.*?)["\'\&]', decoded_url, re.IGNORECASE
@@ -805,7 +986,7 @@ def save_movie_to_db(data_dict):
                 # Episode detection
                 is_combined = "[COMBINED]" in raw_quality
                 js_ep_match = re.search(r"\[(E\d{1,3})\]", raw_quality)
-                js_ep_str = js_ep_match.group(1) if js_ep_match else ""
+                js_ep_str   = js_ep_match.group(1) if js_ep_match else ""
 
                 ep_str = ""
                 s_e_match = re.search(
@@ -831,16 +1012,14 @@ def save_movie_to_db(data_dict):
                 quality = "HD"
                 q_match = re.search(
                     r"\b(2160p|1080p|720p|480p|360p|4K)\b",
-                    combined_text,
-                    re.IGNORECASE,
+                    combined_text, re.IGNORECASE,
                 )
                 if q_match:
                     quality = q_match.group(1).lower()
 
                 src_match = re.search(
                     r"\b(WEB-DL|WEBRip|BluRay|HDRip|HDTC|HDTS|CAMRip)\b",
-                    combined_text,
-                    re.IGNORECASE,
+                    combined_text, re.IGNORECASE,
                 )
                 if src_match:
                     quality += f" {src_match.group(1).upper()}"
@@ -848,8 +1027,7 @@ def save_movie_to_db(data_dict):
                 if quality == "HD":
                     q_fb = re.search(
                         r"\b(2160p|1080p|720p|480p|360p|4K)\b",
-                        raw_quality,
-                        re.IGNORECASE,
+                        raw_quality, re.IGNORECASE,
                     )
                     if q_fb:
                         quality = q_fb.group(1).lower()
@@ -859,10 +1037,11 @@ def save_movie_to_db(data_dict):
                     "Hindi", "English", "Tamil", "Telugu",
                     "Malayalam", "Dual Audio", "Multi",
                 ]
-                langs = []
-                for lk in lang_keywords:
-                    if re.search(r"\b" + lk + r"\b", combined_text, re.IGNORECASE):
-                        langs.append(lk.title())
+                langs = [
+                    lk.title()
+                    for lk in lang_keywords
+                    if re.search(r"\b" + lk + r"\b", combined_text, re.IGNORECASE)
+                ]
                 languages = ", ".join(sorted(set(langs))) if langs else lang_str
 
                 # File size
@@ -871,72 +1050,61 @@ def save_movie_to_db(data_dict):
                         r"(?i)(\d+(?:\.\d+)?\s*(?:gb|mb))", combined_text
                     )
                     file_size = (
-                        sz_m.group(1).strip().upper().replace(" ", "")
-                        if sz_m
-                        else ""
+                        sz_m.group(1).strip().upper().replace(" ", "") if sz_m else ""
                     )
 
                 # Server name
-                m_srv = re.search(
-                    r"(?i)download\s*\[(.+?)\]", srv_name_raw or ""
-                )
+                m_srv = re.search(r"(?i)download\s*\[(.+?)\]", srv_name_raw or "")
                 srv_name = (
                     m_srv.group(1).strip() if m_srv else (srv_name_raw or "").strip()
                 )
                 if not srv_name:
                     srv_name = "Download Server"
 
-                # ── UPSERT: movie_files record ───────────────────────
-                cur.execute(
-                    "SELECT id FROM movie_files "
-                    "WHERE movie_id=%s AND quality=%s AND server_name=%s AND extra_info=%s",
-                    (movie_id, quality, srv_name, ep_str),
+                file_records.append(
+                    (movie_id, quality, srv_name, srv_url, file_size, languages, ep_str)
                 )
 
-                if cur.fetchone():
-                    cur.execute(
-                        """
-                        UPDATE movie_files
-                        SET url=%s, file_size=%s, languages=%s, source='scraped'
-                        WHERE movie_id=%s AND quality=%s AND server_name=%s AND extra_info=%s
-                        """,
-                        (
-                            srv_url, file_size, languages,
-                            movie_id, quality, srv_name, ep_str,
-                        ),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        INSERT INTO movie_files
-                            (movie_id, quality, server_name, url,
-                             file_size, languages, extra_info, source)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,'scraped')
-                        """,
-                        (
-                            movie_id, quality, srv_name, srv_url,
-                            file_size, languages, ep_str,
-                        ),
-                    )
+        # ── Batch upsert all file records in one round-trip ──────────
+        # Uses the existing DB constraint:
+        #   unique_movie_quality_server (movie_id, quality, server_name, extra_info)
+        if file_records:
+            execute_values(
+                cur,
+                """
+                INSERT INTO movie_files
+                    (movie_id, quality, server_name, url,
+                     file_size, languages, extra_info, source)
+                VALUES %s
+                ON CONFLICT (movie_id, quality, server_name, extra_info) DO UPDATE SET
+                    url       = EXCLUDED.url,
+                    file_size = EXCLUDED.file_size,
+                    languages = EXCLUDED.languages,
+                    source    = 'scraped'
+                """,
+                file_records,
+                template="(%s, %s, %s, %s, %s, %s, %s, 'scraped')",
+            )
 
         conn.commit()
         cur.close()
-        conn.close()
-        print(f"   💾 DB Sync Complete: '{title}'", flush=True)
+        print(
+            f"   DB Sync Complete: '{title}' ({len(file_records)} file records)",
+            flush=True,
+        )
 
     except Exception as e:
-        print(f"   ❌ DB Save Error: {e}", flush=True)
+        print(f"   DB Save Error: {e}", flush=True)
         if conn:
             try:
                 conn.rollback()
-                conn.close()
             except Exception:
                 pass
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 
-# =====================================================================
-# CORE: PROCESS A SINGLE MOVIE URL
-# =====================================================================
 async def scrape_and_save_movie(
     movie_url, plugin, browser, main_context, sem,
     is_watchdog=False, site_name="", existing_link_hash=None,
@@ -1081,155 +1249,172 @@ async def run_matrix_mode(plugin, bot_id, total_bots):
     """Scrape ALL URLs from the plugin, split across N bots."""
     print("=" * 60, flush=True)
     print(
-        f"🚀 MATRIX MODE | Site: {plugin.SITE_NAME} "
+        f"MATRIX MODE | Site: {plugin.SITE_NAME} "
         f"| Bot #{bot_id}/{total_bots}",
         flush=True,
     )
-    print(f"⏰ Started: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
     if FORCE_REFRESH:
-        print("⚠️  FORCE_REFRESH=true — all URLs will be re-scraped.", flush=True)
+        print("FORCE_REFRESH=true — all URLs will be re-scraped.", flush=True)
     print("=" * 60, flush=True)
 
     start_time = time.time()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
+    # Create a crawl_runs record for observability
+    run_id = create_crawl_run(plugin.SITE_NAME, "matrix", bot_id, total_bots)
+    run_counters = {"discovered": 0, "processed": 0, "inserted": 0,
+                   "updated": 0, "skipped": 0, "failed": 0}
 
-        # ── Phase 1: URL Discovery ───────────────────────────────────
-        print("\n📥 Phase 1: Discovering URLs...", flush=True)
-        discovery_ctx = await browser.new_context(user_agent=USER_AGENT)
-        all_urls = await plugin.get_all_urls(discovery_ctx)
-        await discovery_ctx.close()
-
-        if not all_urls:
-            print("❌ No URLs discovered. Exiting.", flush=True)
-            await browser.close()
-            return
-
-        # ── Phase 2: Sitemap hash + workload split ───────────────────
-        total = len(all_urls)
-        sitemap_hash = compute_sitemap_hash(all_urls)
-        print(
-            f"\n🔑 Sitemap fingerprint: {sitemap_hash[:8]}… ({total} total URLs)",
-            flush=True,
-        )
-
-        chunk_size = max(1, total // total_bots)
-        start_idx = (bot_id - 1) * chunk_size
-        end_idx = total if bot_id == total_bots else start_idx + chunk_size
-        my_urls = all_urls[start_idx:end_idx]
-
-        # ── Phase 3: Load previous progress (for monitoring) ─────────
-        prev_done = load_progress(
-            plugin.SITE_NAME, bot_id, total_bots, "matrix", sitemap_hash
-        )
-
-        # ── Phase 4: Bulk pre-filter (single round-trip per 10K URLs) ─
-        if FORCE_REFRESH:
-            urls_to_scrape = my_urls
-            already_scraped = {}
-            print(
-                f"\n📋 Bot #{bot_id}: {len(urls_to_scrape)} URLs "
-                f"(force-refresh — bulk pre-filter skipped)",
-                flush=True,
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
-        else:
+
+            # ── Phase 1: URL Discovery ────────────────────────────────────────────────────────────────────────────────────────────
+            print("\nPhase 1: Discovering URLs...", flush=True)
+            discovery_ctx = await browser.new_context(user_agent=USER_AGENT)
+            all_urls = await plugin.get_all_urls(discovery_ctx)
+            await discovery_ctx.close()
+
+            if not all_urls:
+                print("No URLs discovered. Exiting.", flush=True)
+                await browser.close()
+                finish_crawl_run(run_id, "success", run_counters)
+                return
+
+            # ── Phase 2: Sitemap hash + workload split ──────────────────────────────────────────────────────────────────────
+            total = len(all_urls)
+            sitemap_hash = compute_sitemap_hash(all_urls)
+            run_counters["discovered"] = total
             print(
-                f"\n⚡ Phase 4: Bulk pre-filter "
-                f"({len(my_urls)} URLs against scraped_urls)…",
-                flush=True,
-            )
-            already_scraped = get_already_scraped_urls_bulk(
-                plugin.SITE_NAME, my_urls
-            )
-            urls_to_scrape = [u for u in my_urls if u not in already_scraped]
-            print(
-                f"   ⏩ {len(already_scraped)} already scraped → skipping.\n"
-                f"   ✅ {len(urls_to_scrape)} new URLs queued for scraping.",
+                f"\nSitemap fingerprint: {sitemap_hash[:8]}... ({total} total URLs)",
                 flush=True,
             )
 
-        if not urls_to_scrape:
-            print(
-                f"✅ Bot #{bot_id}: Nothing new to scrape. All done!",
-                flush=True,
-            )
-            await browser.close()
-            return
+            chunk_size = max(1, total // total_bots)
+            start_idx = (bot_id - 1) * chunk_size
+            end_idx = total if bot_id == total_bots else start_idx + chunk_size
+            my_urls = all_urls[start_idx:end_idx]
 
-        print(
-            f"📋 Bot #{bot_id}: range [{start_idx}:{end_idx}] | "
-            f"{len(urls_to_scrape)} to scrape",
-            flush=True,
-        )
-
-        # ── Phase 5: Scraping ────────────────────────────────────────
-        main_ctx = await browser.new_context(user_agent=USER_AGENT)
-        await main_ctx.route(
-            "**/*",
-            lambda route: (
-                route.abort()
-                if route.request.resource_type in ["image", "media", "font"]
-                else route.continue_()
-            ),
-        )
-        sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
-
-        done_in_run = 0
-        for i in range(0, len(urls_to_scrape), BATCH_SIZE):
-            if time.time() - start_time > MAX_RUN_TIME_SECONDS:
-                print("⏳ Time limit reached. Stopping gracefully.", flush=True)
-                break
-
-            batch = urls_to_scrape[i : i + BATCH_SIZE]
-            batch_num = i // BATCH_SIZE + 1
-            total_batches = (len(urls_to_scrape) + BATCH_SIZE - 1) // BATCH_SIZE
-            print(
-                f"\n📦 Batch {batch_num}/{total_batches} ({len(batch)} URLs)…",
-                flush=True,
+            # ── Phase 3: Load previous progress (for monitoring) ────────────────────────────────────────────────────────────────────
+            prev_done = load_progress(
+                plugin.SITE_NAME, bot_id, total_bots, "matrix", sitemap_hash
             )
 
-            tasks = [
-                scrape_and_save_movie(
-                    url, plugin, browser, main_ctx, sem,
-                    is_watchdog=False,
-                    site_name=plugin.SITE_NAME,
+            # ── Phase 4: Bulk pre-filter (single round-trip per 10K URLs) ──────────────────────────────────────────────
+            if FORCE_REFRESH:
+                urls_to_scrape = my_urls
+                already_scraped = {}
+                print(
+                    f"\nBot #{bot_id}: {len(urls_to_scrape)} URLs "
+                    f"(force-refresh — bulk pre-filter skipped)",
+                    flush=True,
                 )
-                for url in batch
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            else:
+                print(
+                    f"\nPhase 4: Bulk pre-filter "
+                    f"({len(my_urls)} URLs against scraped_urls)...",
+                    flush=True,
+                )
+                already_scraped = get_already_scraped_urls_bulk(
+                    plugin.SITE_NAME, my_urls
+                )
+                urls_to_scrape = [u for u in my_urls if u not in already_scraped]
+                run_counters["skipped"] = len(already_scraped)
+                print(
+                    f"   {len(already_scraped)} already scraped -> skipping.\n"
+                    f"   {len(urls_to_scrape)} new URLs queued for scraping.",
+                    flush=True,
+                )
 
-            # Log any unhandled exceptions from the gather
-            for url, result in zip(batch, results):
-                if isinstance(result, Exception):
-                    print(f"   ❌ Unhandled: {url} → {result}", flush=True)
+            if not urls_to_scrape:
+                print(
+                    f"Bot #{bot_id}: Nothing new to scrape. All done!",
+                    flush=True,
+                )
+                await browser.close()
+                finish_crawl_run(run_id, "success", run_counters)
+                return
 
-            done_in_run += len(batch)
-
-            # ── Save progress after every batch (crash-resume marker) ─
-            save_progress(
-                plugin.SITE_NAME, bot_id, total_bots, "matrix",
-                prev_done + done_in_run,
-                len(my_urls),
-                sitemap_hash,
+            print(
+                f"Bot #{bot_id}: range [{start_idx}:{end_idx}] | "
+                f"{len(urls_to_scrape)} to scrape",
+                flush=True,
             )
 
-        await main_ctx.close()
-        await browser.close()
+            # ── Phase 5: Scraping ─────────────────────────────────────────────────────────────────────────────────────────────────
+            main_ctx = await browser.new_context(user_agent=USER_AGENT)
+            await main_ctx.route(
+                "**/*",
+                lambda route: (
+                    route.abort()
+                    if route.request.resource_type in ["image", "media", "font"]
+                    else route.continue_()
+                ),
+            )
+            sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-    elapsed = time.time() - start_time
-    print(
-        f"\n✅ Matrix Bot #{bot_id} finished in {elapsed / 60:.1f} min! 🎉",
-        flush=True,
-    )
+            done_in_run = 0
+            for i in range(0, len(urls_to_scrape), BATCH_SIZE):
+                if time.time() - start_time > MAX_RUN_TIME_SECONDS:
+                    print("Time limit reached. Stopping gracefully.", flush=True)
+                    break
+
+                batch = urls_to_scrape[i : i + BATCH_SIZE]
+                batch_num = i // BATCH_SIZE + 1
+                total_batches = (len(urls_to_scrape) + BATCH_SIZE - 1) // BATCH_SIZE
+                print(
+                    f"\nBatch {batch_num}/{total_batches} ({len(batch)} URLs)...",
+                    flush=True,
+                )
+
+                tasks = [
+                    scrape_and_save_movie(
+                        url, plugin, browser, main_ctx, sem,
+                        is_watchdog=False,
+                        site_name=plugin.SITE_NAME,
+                    )
+                    for url in batch
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Log any unhandled exceptions from the gather
+                for url, result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        print(f"   Unhandled: {url} -> {result}", flush=True)
+                        run_counters["failed"] += 1
+
+                done_in_run += len(batch)
+                run_counters["processed"] = done_in_run
+
+                # ── Save progress after every batch (crash-resume marker) ───────────────────────────────────────
+                save_progress(
+                    plugin.SITE_NAME, bot_id, total_bots, "matrix",
+                    prev_done + done_in_run,
+                    len(my_urls),
+                    sitemap_hash,
+                )
+
+            await main_ctx.close()
+            await browser.close()
+
+        elapsed = time.time() - start_time
+        print(
+            f"\nMatrix Bot #{bot_id} finished in {elapsed / 60:.1f} min!",
+            flush=True,
+        )
+        finish_crawl_run(run_id, "success", run_counters)
+
+    except Exception as exc:
+        finish_crawl_run(run_id, "failed", run_counters, error_message=str(exc))
+        raise
 
 
 # =====================================================================
@@ -1239,116 +1424,135 @@ async def run_watchdog_mode(plugin):
     """Scrape only the top N most-recent URLs for daily updates."""
     print("=" * 60, flush=True)
     print(
-        f"🐕 WATCHDOG MODE | Site: {plugin.SITE_NAME} "
+        f"WATCHDOG MODE | Site: {plugin.SITE_NAME} "
         f"| Limit: {plugin.WATCHDOG_LIMIT}",
         flush=True,
     )
-    print(f"⏰ Started: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
     if FORCE_REFRESH:
-        print("⚠️  FORCE_REFRESH=true — link hash check disabled.", flush=True)
+        print("FORCE_REFRESH=true — link hash check disabled.", flush=True)
     print("=" * 60, flush=True)
 
     start_time = time.time()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
+    # Create a crawl_runs record for observability
+    run_id = create_crawl_run(plugin.SITE_NAME, "watchdog")
+    run_counters = {"discovered": 0, "processed": 0, "inserted": 0,
+                    "updated": 0, "skipped": 0, "failed": 0}
 
-        # ── Phase 1: URL Discovery ───────────────────────────────────
-        print("\n📥 Discovering latest URLs...", flush=True)
-        discovery_ctx = await browser.new_context(user_agent=USER_AGENT)
-        all_urls = await plugin.get_all_urls(discovery_ctx, watchdog_mode=True)
-        await discovery_ctx.close()
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
 
-        if not all_urls:
-            print("❌ No URLs discovered. Exiting.", flush=True)
+            # -- Phase 1: URL Discovery --
+            print("\nDiscovering latest URLs...", flush=True)
+            discovery_ctx = await browser.new_context(user_agent=USER_AGENT)
+            all_urls = await plugin.get_all_urls(discovery_ctx, watchdog_mode=True)
+            await discovery_ctx.close()
+
+            if not all_urls:
+                print("No URLs discovered. Exiting.", flush=True)
+                await browser.close()
+                finish_crawl_run(run_id, "success", run_counters)
+                return
+
+            # -- Phase 2: Slice top N --
+            watchdog_urls = all_urls[: plugin.WATCHDOG_LIMIT]
+            run_counters["discovered"] = len(watchdog_urls)
+            print(
+                f"Watchdog scanning top {len(watchdog_urls)} URLs...\n",
+                flush=True,
+            )
+
+            # -- Phase 3: Bulk pre-fetch stored link hashes --
+            # Each URL's stored link_hash lets us skip unchanged content
+            # without re-saving to the DB (full scrape still happens to
+            # compute the new hash, but save is skipped on match).
+            already_scraped = {}
+            if not FORCE_REFRESH:
+                already_scraped = get_already_scraped_urls_bulk(
+                    plugin.SITE_NAME, watchdog_urls
+                )
+                run_counters["skipped"] = len(already_scraped)
+                print(
+                    f"{len(already_scraped)} URLs have stored link hashes "
+                    f"(will skip DB save if unchanged).",
+                    flush=True,
+                )
+
+            # -- Phase 4: Concurrent scraping with hash-based verify --
+            main_ctx = await browser.new_context(user_agent=USER_AGENT)
+            await main_ctx.route(
+                "**/*",
+                lambda route: (
+                    route.abort()
+                    if route.request.resource_type in ["image", "media", "font"]
+                    else route.continue_()
+                ),
+            )
+            sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
+
+            done_in_run = 0
+            for i in range(0, len(watchdog_urls), BATCH_SIZE):
+                if time.time() - start_time > MAX_RUN_TIME_SECONDS:
+                    print("Time limit reached.", flush=True)
+                    break
+
+                batch = watchdog_urls[i : i + BATCH_SIZE]
+                batch_num = i // BATCH_SIZE + 1
+                total_batches = (len(watchdog_urls) + BATCH_SIZE - 1) // BATCH_SIZE
+                print(
+                    f"\nBatch {batch_num}/{total_batches} "
+                    f"({len(batch)} URLs) processing concurrently...",
+                    flush=True,
+                )
+
+                tasks = [
+                    scrape_and_save_movie(
+                        url, plugin, browser, main_ctx, sem,
+                        is_watchdog=True,
+                        site_name=plugin.SITE_NAME,
+                        existing_link_hash=already_scraped.get(url),
+                    )
+                    for url in batch
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for url, result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        print(
+                            f"   Unhandled error for {url}: {result}",
+                            flush=True,
+                        )
+                        run_counters["failed"] += 1
+
+                done_in_run += len(batch)
+                run_counters["processed"] = done_in_run
+
+            await main_ctx.close()
             await browser.close()
-            return
 
-        # ── Phase 2: Slice top N ─────────────────────────────────────
-        watchdog_urls = all_urls[: plugin.WATCHDOG_LIMIT]
+        elapsed = time.time() - start_time
         print(
-            f"📋 Watchdog scanning top {len(watchdog_urls)} URLs…\n",
+            f"\nWatchdog complete in {elapsed / 60:.1f} min! DB synced.",
             flush=True,
         )
+        finish_crawl_run(run_id, "success", run_counters)
 
-        # ── Phase 3: Bulk pre-fetch stored link hashes ───────────────
-        # Each URL's stored link_hash lets us skip unchanged content
-        # without re-saving to the DB (full scrape still happens to
-        # compute the new hash, but save is skipped on match).
-        already_scraped = {}
-        if not FORCE_REFRESH:
-            already_scraped = get_already_scraped_urls_bulk(
-                plugin.SITE_NAME, watchdog_urls
-            )
-            print(
-                f"⚡ {len(already_scraped)} URLs have stored link hashes "
-                f"(will skip DB save if unchanged).",
-                flush=True,
-            )
-
-        # ── Phase 4: Concurrent scraping with hash-based verify ──────
-        main_ctx = await browser.new_context(user_agent=USER_AGENT)
-        await main_ctx.route(
-            "**/*",
-            lambda route: (
-                route.abort()
-                if route.request.resource_type in ["image", "media", "font"]
-                else route.continue_()
-            ),
-        )
-        sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
-
-        for i in range(0, len(watchdog_urls), BATCH_SIZE):
-            if time.time() - start_time > MAX_RUN_TIME_SECONDS:
-                print("⏳ Time limit reached.", flush=True)
-                break
-
-            batch = watchdog_urls[i : i + BATCH_SIZE]
-            batch_num = i // BATCH_SIZE + 1
-            total_batches = (len(watchdog_urls) + BATCH_SIZE - 1) // BATCH_SIZE
-            print(
-                f"\n📦 Batch {batch_num}/{total_batches} "
-                f"({len(batch)} URLs) processing concurrently…",
-                flush=True,
-            )
-
-            tasks = [
-                scrape_and_save_movie(
-                    url, plugin, browser, main_ctx, sem,
-                    is_watchdog=True,
-                    site_name=plugin.SITE_NAME,
-                    existing_link_hash=already_scraped.get(url),
-                )
-                for url in batch
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for url, result in zip(batch, results):
-                if isinstance(result, Exception):
-                    print(
-                        f"   ❌ Unhandled error for {url}: {result}",
-                        flush=True,
-                    )
-
-        await main_ctx.close()
-        await browser.close()
-
-    elapsed = time.time() - start_time
-    print(
-        f"\n✅ Watchdog complete in {elapsed / 60:.1f} min! DB synced. 🎉",
-        flush=True,
-    )
+    except Exception as exc:
+        finish_crawl_run(run_id, "failed", run_counters, error_message=str(exc))
+        raise
 
 
-# =====================================================================
+
 # ENTRY POINT & CLI ARGUMENT PARSER
 # =====================================================================
 def main():
@@ -1436,10 +1640,13 @@ Examples:
     initialize_db()
 
     # ── Dispatch ─────────────────────────────────────────────────────
-    if args.mode == "matrix":
-        asyncio.run(run_matrix_mode(plugin, args.bot_id, args.total_bots))
-    elif args.mode == "watchdog":
-        asyncio.run(run_watchdog_mode(plugin))
+    try:
+        if args.mode == "matrix":
+            asyncio.run(run_matrix_mode(plugin, args.bot_id, args.total_bots))
+        elif args.mode == "watchdog":
+            asyncio.run(run_watchdog_mode(plugin))
+    finally:
+        shutdown_db_pool()
 
 
 if __name__ == "__main__":
