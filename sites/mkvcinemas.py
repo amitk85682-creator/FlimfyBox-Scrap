@@ -1,25 +1,17 @@
 """
 =========================================================================
- sites/mkvcinemas.py — MKVCinemas Site Plugin  [SKELETON]
-=========================================================================
- Template plugin for MKVCinemas. All three interface methods are stubbed
- with TODO markers. Fill in the actual site URL, CSS selectors, sitemap
- path, and bypass logic once you have the site's DOM structure.
-
- To activate:
-   python main.py --site mkvcinemas --mode watchdog
+ sites/mkvcinemas.py — MKVCinemas Site Plugin
 =========================================================================
 """
 
 import asyncio
+import re
 import requests
-import xml.etree.ElementTree as ET
 from sites.base import BaseSitePlugin
-
 
 class SitePlugin(BaseSitePlugin):
     SITE_NAME = "MKVCinemas"
-    TARGET_WEBSITE = "https://mkvcinemas.com"  # TODO: Update to current mirror
+    TARGET_WEBSITE = "https://mkvcinemas.hn"
     WATCHDOG_LIMIT = 50
 
     HEADERS = {
@@ -35,99 +27,212 @@ class SitePlugin(BaseSitePlugin):
     # ==================================================================
     async def get_all_urls(self, context=None, watchdog_mode=False):
         """
-        TODO: Implement URL discovery for MKVCinemas.
-
-        Options:
-          A) XML Sitemap — fetch sitemap.xml, parse <url><loc> entries
-          B) Pagination  — crawl /page/1/, /page/2/ ... via context
-          C) Hybrid      — sitemap index → sub-sitemaps
-
-        Example (sitemap approach):
-            resp = requests.get(
-                f"{self.TARGET_WEBSITE}/post-sitemap.xml",
-                headers=self.HEADERS, timeout=20
-            )
-            root = ET.fromstring(resp.content)
-            ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-            urls = [
-                e.find('ns:loc', ns).text
-                for e in root.findall('ns:url', ns)
-                if e.find('ns:loc', ns) is not None
-            ]
-            return urls
+        Fetch all movie URLs from the sitemap.
         """
-        print(
-            f"⚠️ {self.SITE_NAME} plugin is a skeleton. "
-            f"Implement get_all_urls() to activate.",
-            flush=True,
-        )
-        return []
+        print(f"📥 Fetching {self.SITE_NAME} urls...", flush=True)
+        urls = []
+        try:
+            sitemap_url = f"{self.TARGET_WEBSITE}/sitemap_posts.xml"
+            resp = requests.get(sitemap_url, headers=self.HEADERS, timeout=20)
+            if resp.status_code == 200:
+                locs = re.findall(r'<loc>(.*?)</loc>', resp.text)
+                for loc in locs:
+                    if '/category/' not in loc and '/page/' not in loc and '/tag/' not in loc:
+                        urls.append(loc)
+                print(f"✅ Discovered {len(urls)} URLs from sitemap!", flush=True)
+            else:
+                print(f"❌ Sitemap fetch error, status: {resp.status_code}", flush=True)
+        except Exception as e:
+            print(f"❌ Sitemap fetch error: {e}", flush=True)
+            
+        return urls
 
     # ==================================================================
     # 2. MOVIE DATA EXTRACTION
     # ==================================================================
     async def extract_movie_data(self, page):
         """
-        TODO: Implement page-level data extraction for MKVCinemas.
-
-        Use page.evaluate() with JS that returns a dict like:
-        {
-            'Raw_Title': '...',
-            'Genre': 'N/A',
-            'Stars': 'N/A',
-            'Language': 'Hindi',
-            'Description': 'N/A',
-            'IMDb': 'N/A',
-            'Poster': '',
-            'Director': 'N/A',
-            'Creator': 'N/A',
-            'Type': 'Movies',
-            'raw_download_links': [
-                {'quality': '720p', 'size': '1.2GB', 'url': 'https://...'}
-            ]
-        }
-
-        Tips:
-          - Use document.querySelector('h1') for the title
-          - Look for download buttons/links with site-specific patterns
-          - Parse metadata from the page body text with regex
+        Extract metadata + find quality links.
         """
-        print(
-            f"   ⚠️ {self.SITE_NAME}: extract_movie_data() not implemented.",
-            flush=True,
-        )
-        return None
+        try:
+            raw_h1 = await page.locator("h1").first.inner_text(timeout=10000)
+            raw_h1 = re.sub(r"\s+", " ", raw_h1 or "").strip()
+            
+            poster = await page.evaluate("() => { let img = document.querySelector('img.wp-post-image'); return img ? img.src : ''; }")
+            
+            details = {
+                "Raw_Title": raw_h1,
+                "Poster": poster,
+                "Type": "Movies",
+                "download_page_url": ""
+            }
+            
+            # Find filesdl.live aggregator link
+            filesdl_master_url = await page.evaluate(r'''() => {
+                let target = Array.from(document.querySelectorAll('a')).find(a => (a.href || "").includes('filesdl.live'));
+                return target ? target.href : null;
+            }''')
+            
+            if not filesdl_master_url:
+                print("   ⚠️ filesdl aggregator link nahi mila.", flush=True)
+                return None
+                
+            details["download_page_url"] = filesdl_master_url
+            
+            raw_links = []
+            dl_page = await page.context.new_page()
+            try:
+                await dl_page.goto(filesdl_master_url, timeout=60000, wait_until="domcontentloaded")
+                await dl_page.wait_for_timeout(3000)
+                
+                raw_links = await dl_page.evaluate(r'''() => {
+                    let results = [];
+                    let buttons = Array.from(document.querySelectorAll('a')).filter(a => (a.innerText || "").toLowerCase().includes('hubcloud'));
+                    
+                    buttons.forEach(btn => {
+                        let container = btn.closest('div.card') || btn.closest('div.shadow') || btn.parentElement.parentElement;
+                        let textBlock = container ? container.innerText : "";
+                        let match = textBlock.match(/(\d{3,4}P.*?DOWNLOAD.*?(MB|GB))/i);
+                        let qualityStr = match ? match[1].replace(/DOWNLOAD/i, '').replace(/\s+/g, ' ').trim() : "Unknown Quality";
+                        results.push({ quality: qualityStr, url: btn.href, size: '' });
+                    });
+                    return results;
+                }''')
+            except Exception as e:
+                print(f"   ⚠️ DL Page error: {e}", flush=True)
+            finally:
+                await dl_page.close()
+                
+            details["raw_download_links"] = raw_links
+            return details
+
+        except Exception as e:
+            print(f"   ⚠️ Extract error: {e}", flush=True)
+            return None
 
     # ==================================================================
     # 3. BYPASS LOGIC
     # ==================================================================
+    async def bypass_hubcloud_chain(self, context, hubdrive_url):
+        page = await context.new_page()
+        try:
+            await page.goto(hubdrive_url, timeout=60000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(4000)
+            
+            hubcloud_url = await page.evaluate(r'''() => {
+                let links = Array.from(document.querySelectorAll('a, button'));
+                let target = links.find(a => (a.innerText || "").toLowerCase().includes('hubcloud server'));
+                if (!target) return null;
+                if (target.href) return target.href;
+                let onclickMatch = (target.getAttribute('onclick') || "").match(/['"](https?:\/\/[^'"]+)['"]/);
+                return onclickMatch ? onclickMatch[1] : null;
+            }''')
+            
+            if not hubcloud_url: return None
+            
+            await page.goto(hubcloud_url, timeout=60000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(8000)
+            
+            gamerxyt_url = await page.evaluate(r'''() => {
+                let links = Array.from(document.querySelectorAll('a, button'));
+                let target = links.find(a => (a.innerText || "").toLowerCase().includes('generate') || (a.innerText || "").toLowerCase().includes('direct download'));
+                if (!target) return null;
+                if (target.href && target.href.includes('http')) return target.href;
+                let onclickMatch = (target.getAttribute('onclick') || "").match(/['"](https?:\/\/[^'"]+)['"]/);
+                return onclickMatch ? onclickMatch[1] : null;
+            }''')
+            
+            if gamerxyt_url and 'http' in gamerxyt_url:
+                await page.goto(gamerxyt_url, timeout=60000, wait_until="domcontentloaded")
+            else:
+                try:
+                    await page.locator('text="Generate Direct Download Link"').click(timeout=10000)
+                except:
+                    pass
+                
+            await page.wait_for_timeout(8000)
+            
+            final_servers = await page.evaluate(r'''() => {
+                let links = Array.from(document.querySelectorAll('a'));
+                let results = [];
+                links.forEach(a => {
+                    let text = a.innerText.trim();
+                    let href = a.href;
+                    let lower = text.toLowerCase();
+                    if(lower.includes('server') || lower.includes('fsl') || lower.includes('pixel') || lower.includes('buzz') || lower.includes('10gbps')) {
+                        results.push({ server_name: text, url: href });
+                    }
+                });
+                return results;
+            }''')
+            return final_servers
+        except Exception as e:
+            print(f"   ⚠️ bypass_hubcloud_chain error: {e}", flush=True)
+            return None
+        finally:
+            await page.close()
+
     async def bypass_links(self, context, browser, raw_links):
-        """
-        TODO: Implement download link bypass for MKVCinemas.
-
-        MKVCinemas typically uses HubCloud-based hosting.
-        You can reuse the HubCloud bypass chain from hdhub4u.py:
-
-            from sites.hdhub4u import SitePlugin as HDHub4uPlugin
-            hdhub4u = HDHub4uPlugin()
-            return await hdhub4u.bypass_links(context, browser, raw_links)
-
-        Or implement a custom bypass if the site uses different
-        intermediary services.
-
-        Must return:
-        [
-            {
-                'quality': '720p WEB-DL',
-                'size': '1.2GB',
-                'direct_links': [
-                    {'server_name': 'Server 1', 'url': 'https://...'}
-                ]
+        async def _extract(item):
+            page = await context.new_page()
+            servers = []
+            size = item.get("size", "")
+            try:
+                await page.goto(item["url"], timeout=60000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(3000)
+                
+                extracted = await page.evaluate(r'''() => {
+                    let docText = document.body.innerText;
+                    let fNameMatch = docText.match(/(.*?\.(mkv|mp4|zip|rar|avi))/i);
+                    let fSizeMatch = docText.match(/Size:\s*([\d\.]+\s*(MB|GB))/i);
+                    
+                    let pd = null, hc = null;
+                    Array.from(document.querySelectorAll('button, a')).forEach(el => {
+                        let text = (el.innerText || "").toLowerCase();
+                        let onclickMatch = (el.getAttribute('onclick') || "").match(/['"](https?:\/\/[^'"]+)['"]/);
+                        let finalUrl = onclickMatch ? onclickMatch[1] : (el.getAttribute('href') || "");
+                        
+                        if (text.includes('pixeldrain') && finalUrl) pd = finalUrl;
+                        if (text.includes('hubcloud') && finalUrl) hc = finalUrl;
+                    });
+                    return { 
+                        filename: fNameMatch ? fNameMatch[1].trim() : "Unknown", 
+                        size: fSizeMatch ? fSizeMatch[1] : "Unknown", 
+                        pixeldrain: pd, 
+                        hubcloud: hc 
+                    };
+                }''')
+                
+                if extracted.get("size") and extracted.get("size") != "Unknown":
+                    size = extracted["size"]
+                
+                if extracted.get("pixeldrain"):
+                    servers.append({"server_name": "PixelDrain", "url": extracted["pixeldrain"]})
+                    
+                hc_url = extracted.get("hubcloud")
+                if hc_url:
+                    if "worrkers.dev" in hc_url:
+                        servers.append({"server_name": "Direct Worker", "url": hc_url})
+                    else:
+                        hc_servers = await self.bypass_hubcloud_chain(context, hc_url)
+                        if hc_servers:
+                            servers.extend(hc_servers)
+                            
+            except Exception as e:
+                print(f"   ⚠️ Server bypass error: {e}", flush=True)
+            finally:
+                await page.close()
+                
+            return {
+                "quality": item["quality"],
+                "size": size,
+                "direct_links": servers
             }
-        ]
-        """
-        print(
-            f"   ⚠️ {self.SITE_NAME}: bypass_links() not implemented.",
-            flush=True,
-        )
-        return []
+            
+        tasks = [_extract(item) for item in raw_links]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        valid = []
+        for r in results:
+            if isinstance(r, Exception): continue
+            if r and r.get("direct_links"): valid.append(r)
+        return valid
