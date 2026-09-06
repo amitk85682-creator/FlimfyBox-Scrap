@@ -80,11 +80,12 @@ async def check_link(session, context, file_id, url, title, sem, dead_ids):
 
 
 async def clean_database_chunk():
-    conn = psycopg2.connect(DATABASE_URL)
+    read_conn = psycopg2.connect(DATABASE_URL)
+    write_conn = psycopg2.connect(DATABASE_URL)
 
     # Use a named server-side cursor so rows are streamed in batches
     # rather than being loaded all at once into Python memory.
-    cur = conn.cursor("dead_link_cursor")
+    cur = read_conn.cursor("dead_link_cursor")
     cur.itersize = DB_FETCH_SIZE
 
     cur.execute(
@@ -105,8 +106,8 @@ async def clean_database_chunk():
     total_checked = 0
     total_dead    = 0
 
-    # Plain write cursor for deletes
-    write_cur = conn.cursor()
+    # Plain write cursor for deletes on a separate connection
+    write_cur = write_conn.cursor()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -137,7 +138,7 @@ async def clean_database_chunk():
                     write_cur.execute(
                         "DELETE FROM movie_files WHERE id = ANY(%s)", (dead_ids,)
                     )
-                    conn.commit()
+                    write_conn.commit()
                     total_dead    += len(dead_ids)
                     print(
                         f"  Deleted {len(dead_ids)} dead links from this batch.",
@@ -149,8 +150,9 @@ async def clean_database_chunk():
         await browser.close()
 
     cur.close()
+    read_conn.close()
     write_cur.close()
-    conn.close()
+    write_conn.close()
 
     print(
         f"\nChunk {CHUNK_INDEX} done. "
