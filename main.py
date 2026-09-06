@@ -1069,6 +1069,15 @@ def save_movie_to_db(data_dict):
         # Uses the existing DB constraint:
         #   unique_movie_quality_server (movie_id, quality, server_name, extra_info)
         if file_records:
+            # Deduplicate within the batch (Postgres ON CONFLICT cannot update the same row twice)
+            unique_records = {}
+            for rec in file_records:
+                # rec = (movie_id, quality, srv_name, srv_url, file_size, languages, ep_str)
+                key = (rec[0], rec[1], rec[2], rec[6])
+                unique_records[key] = rec
+            
+            deduped_records = list(unique_records.values())
+
             execute_values(
                 cur,
                 """
@@ -1082,7 +1091,7 @@ def save_movie_to_db(data_dict):
                     languages = EXCLUDED.languages,
                     source    = 'scraped'
                 """,
-                file_records,
+                deduped_records,
                 template="(%s, %s, %s, %s, %s, %s, %s, 'scraped')",
             )
 
