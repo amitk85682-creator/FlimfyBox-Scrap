@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_queue.py - Phase B Integration Tests
 Run with: pytest tests/test_queue.py -v
 Requires: DATABASE_URL env var pointing to the Supabase PostgreSQL instance.
@@ -198,6 +198,11 @@ def test_5_zombie_worker_cannot_commit(db_conn):
 
     # Sweeper reclaims
     recover_expired_leases(db_conn)
+
+    # Force next_retry_at to past so worker_B can claim it immediately
+    cur = db_conn.cursor()
+    cur.execute("UPDATE crawl_jobs SET next_retry_at = NOW() - INTERVAL '1 minute' WHERE id = %s;", (job_a["id"],))
+    cur.close()
 
     # Worker B claims
     job_b = claim_next_job(db_conn, TEST_SITE, worker_id="worker_B")

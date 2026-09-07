@@ -28,6 +28,7 @@ import json
 import argparse
 import importlib
 import urllib.parse
+import threading
 
 import hashlib
 import signal
@@ -1811,23 +1812,34 @@ async def run_worker_mode(plugin, max_jobs: int = 0):
                     release_db_connection(conn_u)
                 last_crawl_run_update = time.time()
 
-            # Try to claim a job
-            async with sem:
-                conn_c = get_db_connection()
-                try:
-                    job = claim_next_job(
-                        conn_c, site_name=plugin.SITE_NAME, worker_id=WORKER_ID
-                    )
-                finally:
-                    release_db_connection(conn_c)
+            # Wait for a free slot
+            await sem.acquire()
+            
+            conn_c = get_db_connection()
+            try:
+                job = claim_next_job(
+                    conn_c, site_name=plugin.SITE_NAME, worker_id=WORKER_ID
+                )
+            finally:
+                release_db_connection(conn_c)
 
-                if job is None:
-                    # Queue is empty — wait before polling again
-                    print("   Queue empty. Waiting 10s...", flush=True)
-                    await asyncio.sleep(10)
-                    continue
+            if job is None:
+                # Queue is empty — wait before polling again
+                sem.release()
+                print("   Queue empty. Waiting 10s...", flush=True)
+                await asyncio.sleep(10)
+                continue
 
-                asyncio.ensure_future(process_one_job(job))
+            # Create the task
+            t = asyncio.ensure_future(process_one_job(job))
+            
+            # When the task completes, release the semaphore and remove from active tracking
+            def _on_job_done(task, j_id=job["id"]):
+                _active_jobs.pop(j_id, None)
+                sem.release()
+                
+            t.add_done_callback(_on_job_done)
+            _active_jobs[job["id"]] = t
 
     finally:
         # Let active tasks drain (up to 2 minutes)
