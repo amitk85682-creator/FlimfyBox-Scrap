@@ -19,10 +19,10 @@
 name: "🚀 Universal Scraper Cluster"
 
 on:
-  # ── Scheduled: daily watchdog for all sites ──────────────────────────────────
+  # ── Scheduled: Phase B Continuous Operation ──────────────────────────────────
   schedule:
-    - cron: "30 0,4,6,10,14,18 * * *"       # 6AM, 10AM, 12PM, 4PM, 8PM, 12AM IST
-    - cron: "0 2 * * 0"                      # Weekly Sunday 2AM UTC — full link-hash refresh
+    - cron: "30 0,12 * * *"                  # Discovery: runs twice daily to populate queue
+    - cron: "0 0,3,6,9,12,15,18,21 * * *"    # Workers: drain queue continuously (every 3 hours)
 
   # ── Manual trigger with full control ───────────────────────────────
   workflow_dispatch:
@@ -87,20 +87,26 @@ jobs:
       - name: Compute matrix dimensions
         id: compute
         run: |
-          # ── Determine mode ────────────────────────────────────────────
+          # ── Determine mode and scheduled flags ────────────────────────
           if [ "${{ github.event_name }}" == "schedule" ]; then
-            MODE="watchdog"
+            if [ "${{ github.event.schedule }}" == "30 0,12 * * *" ]; then
+              MODE="discovery"
+              FORCE="false"
+              DISC_WD="true"
+            else
+              MODE="worker"
+              FORCE="false"
+              DISC_WD="false"
+            fi
           else
             MODE="${{ github.event.inputs.mode }}"
+            FORCE="${{ github.event.inputs.force_refresh || 'false' }}"
+            DISC_WD="${{ github.event.inputs.discovery_watchdog || 'false' }}"
           fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
 
-          # ── Determine force_refresh flag ──────────────────────────────
-          FORCE="${{ github.event.inputs.force_refresh || 'false' }}"
+          # ── Output flags ──────────────────────────────────────────────
           echo "force_refresh=$FORCE" >> "$GITHUB_OUTPUT"
-
-          # ── Discovery watchdog flag ───────────────────────────────────
-          DISC_WD="${{ github.event.inputs.discovery_watchdog || 'false' }}"
           echo "discovery_watchdog=$DISC_WD" >> "$GITHUB_OUTPUT"
 
           # ── Max worker jobs ───────────────────────────────────────────
@@ -110,7 +116,12 @@ jobs:
           # ── Determine site list ────────────────────────────────────
           SITE="${{ github.event.inputs.site || 'all' }}"
           if [ "$SITE" == "all" ]; then
-            echo 'site_matrix=["filmyzilla","hdhub4u","mkvcinemas"]' >> "$GITHUB_OUTPUT"
+            if [ "$MODE" == "worker" ]; then
+              # Start with 2 workers conservatively for continuous operation
+              echo 'site_matrix=["filmyzilla","hdhub4u"]' >> "$GITHUB_OUTPUT"
+            else
+              echo 'site_matrix=["filmyzilla","hdhub4u","mkvcinemas"]' >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "site_matrix=[\"$SITE\"]" >> "$GITHUB_OUTPUT"
           fi
