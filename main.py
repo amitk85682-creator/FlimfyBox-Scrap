@@ -1576,6 +1576,9 @@ async def run_worker_mode(plugin, max_jobs: int = 0):
     print("=" * 60, flush=True)
 
     start_time = time.time()
+    idle_timeout = int(os.environ.get("WORKER_IDLE_TIMEOUT", 60 if max_jobs > 0 else 0))
+    idle_start = time.time()
+
     run_id = create_crawl_run(plugin.SITE_NAME, "worker")
     counters = {"discovered": 0, "processed": 0, "inserted": 0,
                 "updated": 0, "skipped": 0, "failed": 0}
@@ -1826,9 +1829,19 @@ async def run_worker_mode(plugin, max_jobs: int = 0):
             if job is None:
                 # Queue is empty — wait before polling again
                 sem.release()
+                
+                if _active_jobs:
+                    idle_start = time.time()  # Reset idle timer if jobs are still processing
+                elif idle_timeout > 0 and (time.time() - idle_start > idle_timeout):
+                    print(f"\n⏳ Queue empty continuously for {idle_timeout}s. Exiting worker.", flush=True)
+                    break
+
                 print("   Queue empty. Waiting 10s...", flush=True)
                 await asyncio.sleep(10)
                 continue
+
+            # Successfully claimed a job
+            idle_start = time.time()
 
             # Create the task
             t = asyncio.ensure_future(process_one_job(job))
