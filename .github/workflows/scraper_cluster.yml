@@ -5,11 +5,15 @@
 #
 # Triggers:
 #   • Cron   : Daily midnight UTC → Watchdog mode for all sites
-#   • Manual : Choose mode (matrix/watchdog), site, and bot count
+#   • Manual : Choose mode (matrix/watchdog/discovery/worker), site, bot count
 #
 # Architecture:
 #   1. "setup" job computes the dynamic matrix from inputs
 #   2. "scrape" job fans out across site × bot_id combinations
+#
+# Phase B modes:
+#   • discovery : Seed crawl_jobs queue (no extraction)
+#   • worker    : Drain crawl_jobs queue (full extraction pipeline)
 # ======================================================================
 
 name: "🚀 Universal Scraper Cluster"
@@ -31,6 +35,8 @@ on:
         options:
           - watchdog
           - matrix
+          - discovery
+          - worker
       site:
         description: "Target site (or 'all')"
         required: true
@@ -42,7 +48,7 @@ on:
           - hdhub4u
           - mkvcinemas
       total_bots:
-        description: "Parallel bots per site (matrix mode only)"
+        description: "Parallel bots per site (matrix/discovery mode only)"
         required: false
         default: "5"
         type: string
@@ -51,6 +57,16 @@ on:
         required: false
         default: "false"
         type: boolean
+      discovery_watchdog:
+        description: "Discovery watchdog mode (top-N only, for 'discovery' mode)"
+        required: false
+        default: "false"
+        type: boolean
+      max_worker_jobs:
+        description: "Max jobs per worker run (0=unlimited, for 'worker' mode GHA)"
+        required: false
+        default: "500"
+        type: string
 
 jobs:
   # ================================================================
@@ -59,11 +75,13 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      site_matrix:   ${{ steps.compute.outputs.site_matrix }}
-      bot_matrix:    ${{ steps.compute.outputs.bot_matrix }}
-      mode:          ${{ steps.compute.outputs.mode }}
-      total_bots:    ${{ steps.compute.outputs.total_bots }}
-      force_refresh: ${{ steps.compute.outputs.force_refresh }}
+      site_matrix:       ${{ steps.compute.outputs.site_matrix }}
+      bot_matrix:        ${{ steps.compute.outputs.bot_matrix }}
+      mode:              ${{ steps.compute.outputs.mode }}
+      total_bots:        ${{ steps.compute.outputs.total_bots }}
+      force_refresh:     ${{ steps.compute.outputs.force_refresh }}
+      discovery_watchdog: ${{ steps.compute.outputs.discovery_watchdog }}
+      max_worker_jobs:   ${{ steps.compute.outputs.max_worker_jobs }}
 
     steps:
       - name: Compute matrix dimensions
@@ -81,6 +99,14 @@ jobs:
           FORCE="${{ github.event.inputs.force_refresh || 'false' }}"
           echo "force_refresh=$FORCE" >> "$GITHUB_OUTPUT"
 
+          # ── Discovery watchdog flag ───────────────────────────────────
+          DISC_WD="${{ github.event.inputs.discovery_watchdog || 'false' }}"
+          echo "discovery_watchdog=$DISC_WD" >> "$GITHUB_OUTPUT"
+
+          # ── Max worker jobs ───────────────────────────────────────────
+          MAX_WJ="${{ github.event.inputs.max_worker_jobs || '500' }}"
+          echo "max_worker_jobs=$MAX_WJ" >> "$GITHUB_OUTPUT"
+
           # ── Determine site list ────────────────────────────────────
           SITE="${{ github.event.inputs.site || 'all' }}"
           if [ "$SITE" == "all" ]; then
@@ -93,11 +119,11 @@ jobs:
           TOTAL="${{ github.event.inputs.total_bots || '5' }}"
           echo "total_bots=$TOTAL" >> "$GITHUB_OUTPUT"
 
-          if [ "$MODE" == "watchdog" ]; then
-            # Watchdog only needs 1 bot per site
+          if [ "$MODE" == "watchdog" ] || [ "$MODE" == "worker" ]; then
+            # Watchdog and worker only need 1 bot per site
             echo 'bot_matrix=[1]' >> "$GITHUB_OUTPUT"
           else
-            # Matrix mode: generate [1, 2, ..., N]
+            # Matrix / discovery mode: generate [1, 2, ..., N]
             BOT_LIST=$(python3 -c "import json; print(json.dumps(list(range(1, int('$TOTAL')+1))))")
             echo "bot_matrix=$BOT_LIST" >> "$GITHUB_OUTPUT"
           fi
@@ -137,14 +163,17 @@ jobs:
       # ── Run ──────────────────────────────────────────────────────
       - name: "🚀 Run ${{ needs.setup.outputs.mode }} — ${{ matrix.site }} (Bot ${{ matrix.bot_id }})"
         env:
-          DATABASE_URL:    ${{ secrets.DATABASE_URL }}
-          TMDB_API_KEY:    ${{ secrets.TMDB_API_KEY }}
-          FORCE_REFRESH:   ${{ needs.setup.outputs.force_refresh }}
-          DB_POOL_SIZE:    "3"
-          PYTHONUNBUFFERED: "1"
+          DATABASE_URL:         ${{ secrets.DATABASE_URL }}
+          TMDB_API_KEY:         ${{ secrets.TMDB_API_KEY }}
+          FORCE_REFRESH:        ${{ needs.setup.outputs.force_refresh }}
+          DB_POOL_SIZE:         "7"
+          DISCOVERY_WATCHDOG:   ${{ needs.setup.outputs.discovery_watchdog }}
+          MAX_WORKER_JOBS:      ${{ needs.setup.outputs.max_worker_jobs }}
+          PYTHONUNBUFFERED:     "1"
         run: |
           python main.py \
             --site ${{ matrix.site }} \
             --mode ${{ needs.setup.outputs.mode }} \
             --bot_id ${{ matrix.bot_id }} \
             --total_bots ${{ needs.setup.outputs.total_bots }}
+

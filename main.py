@@ -19,6 +19,7 @@
 """
 
 import asyncio
+import logging
 import os
 import re
 import sys
@@ -29,6 +30,7 @@ import importlib
 import urllib.parse
 
 import hashlib
+import signal
 import requests
 import psycopg2
 from psycopg2 import pool as psycopg2_pool
@@ -36,7 +38,28 @@ from psycopg2.extras import execute_values
 import nest_asyncio
 from playwright.async_api import async_playwright
 
+import job_queue
+from job_queue import (
+    HeartbeatManager,
+    WORKER_ID,
+    claim_next_job,
+    enqueue_jobs_bulk,
+    enqueue_forced_reprocess,
+    validate_ownership_for_write,
+    ack_job,
+    fail_job,
+    release_job,
+    recover_expired_leases,
+    cleanup_old_jobs,
+    get_queue_stats,
+)
+
 nest_asyncio.apply()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 
 # =====================================================================
@@ -247,8 +270,13 @@ def initialize_db():
 
         conn.commit()
         cur.close()
+
+        # ── Phase B: crawl_jobs queue table ──────────────────────────
+        # CREATE TABLE IF NOT EXISTS + indexes — safe to run on every boot
+        job_queue.create_crawl_jobs_table(conn)
+
         print(
-            "✅ DB initialized — scraped_urls + scraper_state + crawl_runs tables ready.",
+            "✅ DB initialized — scraped_urls + scraper_state + crawl_runs + crawl_jobs ready.",
             flush=True,
         )
     except Exception as e:
@@ -1114,6 +1142,710 @@ def save_movie_to_db(data_dict):
             release_db_connection(conn)
 
 
+def fenced_save_movie_to_db(data_dict, job_id: int, worker_id: str,
+                             heartbeat_manager=None) -> bool:
+    """
+    Phase B version of save_movie_to_db — identical business logic but
+    wraps the final DB writes inside a transaction with ownership fencing.
+
+    Transaction sequence:
+      1. BEGIN
+      2. SELECT crawl_jobs ... FOR UPDATE NOWAIT  (ownership fencing)
+      3. movies upsert
+      4. movie_files batch upsert
+      5. ack_job (mark completed inside same transaction)
+      6. COMMIT
+
+    If ownership fencing fails at step 2 (lease expired or stolen by sweeper),
+    the transaction is rolled back and NO application data is written.
+
+    Returns True on success, False if ownership was lost.
+    """
+    if heartbeat_manager and heartbeat_manager.is_lost(job_id):
+        print(
+            f"   ⚠️ Ownership lost (heartbeat detected) for job {job_id}. "
+            "Aborting write.",
+            flush=True,
+        )
+        return False
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        # Disable autocommit so we control the transaction boundary
+        conn.autocommit = False
+        cur = conn.cursor()
+        cur.execute("SET statement_timeout = 30000;")
+
+        # ── Step 1: Ownership fencing ─────────────────────────────────
+        # Lock the crawl_jobs row. Fails instantly if:
+        #   - another worker holds the lock (NOWAIT)
+        #   - claimed_by != worker_id
+        #   - lease_expires_at <= NOW()
+        if not validate_ownership_for_write(cur, job_id, worker_id):
+            conn.rollback()
+            print(
+                f"   ⚠️ Fencing check failed for job {job_id}: "
+                "lease expired or ownership lost. Aborting write.",
+                flush=True,
+            )
+            return False
+
+        # ── Steps 2-4: Identical business logic from save_movie_to_db ─
+        tmdb = data_dict.get("tmdb_data") or {}
+
+        title = tmdb.get("Title") or data_dict.get("clean_title")
+        if title:
+            junk = (
+                r"(?i)\b(uncut|hindi|dual\s*audio|dubbed|480p|720p|1080p|"
+                r"hdrip|webrip|web-dl|x264|hevc|esubs?|mb|gb|brrip|"
+                r"dvdrip|hdtc|camrip|x265|aac)\b"
+            )
+            title = re.sub(junk, "", title).strip()
+            title = re.sub(r"\b(19|20)\d{2}\b", "", title).strip()
+            title = re.sub(r"[\(\)\[\]\-]+", " ", title).strip()
+            title = re.sub(r"\s+", " ", title).strip()
+
+        if not title:
+            print("   Warning: No valid title. Skipping DB save.", flush=True)
+            conn.rollback()
+            return False
+
+        year = (
+            tmdb.get("Release", "")[:4]
+            if tmdb.get("Release")
+            else data_dict.get("Year", "N/A")
+        )
+        poster = (
+            tmdb.get("Poster")
+            if tmdb.get("Poster") and tmdb.get("Poster") != "N/A"
+            else ""
+        )
+        page_genre  = data_dict.get("Genre", "N/A")
+        page_rating = data_dict.get("IMDb", "N/A")
+        page_cast   = data_dict.get("Stars", "N/A")
+        page_lang   = data_dict.get("Language", "N/A")
+        page_desc   = data_dict.get("Description", "N/A")
+
+        genre_str  = page_genre  if page_genre  != "N/A" else tmdb.get("Genre", "N/A")
+        rating_str = page_rating if page_rating != "N/A" else tmdb.get("TMDb_Rating", "N/A")
+        cast_str   = page_cast   if page_cast   != "N/A" else tmdb.get("Cast", "N/A")
+        plot_str   = page_desc   if page_desc   != "N/A" else tmdb.get("Description", "N/A")
+        lang_str   = page_lang   if page_lang   != "N/A" else "Hindi"
+
+        imdb_id_real = tmdb.get("imdb_id")
+        seasons_json = tmdb.get("seasons_data", {})
+
+        if data_dict.get("Type") == "Hot Web Series":
+            final_category = "Hot Web Series"
+        else:
+            final_category = (
+                "Web Series"
+                if data_dict.get("Type") == "Web Series" or tmdb.get("is_tv")
+                else "Movies"
+            )
+
+        try:
+            year_val = int(year)
+        except (ValueError, TypeError):
+            year_val = None
+
+        # movies upsert
+        cur.execute("SELECT id FROM movies WHERE title = %s LIMIT 1", (title,))
+        row = cur.fetchone()
+        if row:
+            movie_id = row[0]
+            cur.execute(
+                """
+                UPDATE movies SET
+                    url          = %s,
+                    poster_url   = COALESCE(NULLIF(poster_url, ''), %s),
+                    seasons_data = %s
+                WHERE id = %s
+                """,
+                (data_dict["url"], poster, json.dumps(seasons_json), movie_id),
+            )
+        else:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO movies
+                        (url, title, poster_url, year, genre, description,
+                         rating, language, "cast", imdb_id, seasons_data, category)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (title) DO UPDATE SET
+                        url          = EXCLUDED.url,
+                        poster_url   = COALESCE(NULLIF(movies.poster_url,''), EXCLUDED.poster_url),
+                        seasons_data = EXCLUDED.seasons_data
+                    RETURNING id;
+                    """,
+                    (
+                        data_dict["url"], title, poster, year_val,
+                        genre_str, plot_str, rating_str, lang_str,
+                        cast_str, imdb_id_real, json.dumps(seasons_json),
+                        final_category,
+                    ),
+                )
+                result = cur.fetchone()
+                movie_id = result[0] if result else None
+            except psycopg2.errors.UndefinedObject:
+                conn.rollback()
+                # Re-validate after rollback
+                if not validate_ownership_for_write(cur, job_id, worker_id):
+                    return False
+                cur.execute(
+                    """
+                    INSERT INTO movies
+                        (url, title, poster_url, year, genre, description,
+                         rating, language, "cast", imdb_id, seasons_data, category)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING id;
+                    """,
+                    (
+                        data_dict["url"], title, poster, year_val,
+                        genre_str, plot_str, rating_str, lang_str,
+                        cast_str, imdb_id_real, json.dumps(seasons_json),
+                        final_category,
+                    ),
+                )
+                movie_id = cur.fetchone()[0]
+
+        if not movie_id:
+            conn.rollback()
+            return False
+
+        # movie_files batch upsert
+        default_season  = data_dict.get("Default_Season") or 1
+        bypassed_links  = data_dict.get("bypassed_links", [])
+        file_records    = []
+
+        for link_group in bypassed_links:
+            raw_quality  = link_group.get("quality", "Unknown")
+            file_size    = link_group.get("size", "")
+            direct_links = link_group.get("direct_links", [])
+
+            for server in direct_links:
+                srv_name_raw = server.get("server_name", "Download Server")
+                srv_url      = server.get("url", "").strip()
+                if not srv_url:
+                    continue
+
+                decoded_url    = urllib.parse.unquote(srv_url)
+                fn_match       = re.search(r'filename=["\']?(.*?)["\'\'&]', decoded_url, re.IGNORECASE)
+                actual_filename = fn_match.group(1) if fn_match else decoded_url
+                combined_text  = f"{actual_filename} {raw_quality}"
+
+                is_combined = "[COMBINED]" in raw_quality
+                js_ep_match = re.search(r"\[(E\d{1,3})\]", raw_quality)
+                js_ep_str   = js_ep_match.group(1) if js_ep_match else ""
+
+                ep_str = ""
+                s_e_match = re.search(r"(?i)\bS(\d{1,2})[\s._-]*E(\d{1,3})\b", actual_filename)
+                if s_e_match:
+                    ep_str = f"S{int(s_e_match.group(1)):02d}E{int(s_e_match.group(2)):02d}"
+                elif js_ep_str:
+                    ep_str = f"S{default_season:02d}{js_ep_str}"
+                elif is_combined or re.search(
+                    r"(?i)\b(batch|full season|complete|all episodes|pack|zip)\b", combined_text
+                ):
+                    ep_str = f"S{default_season:02d} Combined"
+
+                if final_category == "Movies":
+                    ep_str = ""
+
+                quality = "HD"
+                q_match = re.search(r"\b(2160p|1080p|720p|480p|360p|4K)\b", combined_text, re.IGNORECASE)
+                if q_match:
+                    quality = q_match.group(1).lower()
+
+                src_match = re.search(r"\b(WEB-DL|WEBRip|BluRay|HDRip|HDTC|HDTS|CAMRip)\b", combined_text, re.IGNORECASE)
+                if src_match:
+                    quality += f" {src_match.group(1).upper()}"
+
+                if quality == "HD":
+                    q_fb = re.search(r"\b(2160p|1080p|720p|480p|360p|4K)\b", raw_quality, re.IGNORECASE)
+                    if q_fb:
+                        quality = q_fb.group(1).lower()
+
+                lang_keywords = ["Hindi", "English", "Tamil", "Telugu", "Malayalam", "Dual Audio", "Multi"]
+                langs = [lk.title() for lk in lang_keywords
+                         if re.search(r"\b" + lk + r"\b", combined_text, re.IGNORECASE)]
+                languages = ", ".join(sorted(set(langs))) if langs else lang_str
+
+                if not file_size or file_size.lower() in ("", "n/a", "unknown"):
+                    sz_m = re.search(r"(?i)(\d+(?:\.\d+)?\s*(?:gb|mb))", combined_text)
+                    file_size = sz_m.group(1).strip().upper().replace(" ", "") if sz_m else ""
+
+                m_srv = re.search(r"(?i)download\s*\[(.+?)\]", srv_name_raw or "")
+                srv_name = m_srv.group(1).strip() if m_srv else (srv_name_raw or "").strip()
+                if not srv_name:
+                    srv_name = "Download Server"
+
+                file_records.append(
+                    (movie_id, quality, srv_name, srv_url, file_size, languages, ep_str)
+                )
+
+        if file_records:
+            unique_records = {}
+            for rec in file_records:
+                key = (rec[0], rec[1], rec[2], rec[6])
+                unique_records[key] = rec
+            deduped_records = list(unique_records.values())
+
+            execute_values(
+                cur,
+                """
+                INSERT INTO movie_files
+                    (movie_id, quality, server_name, url,
+                     file_size, languages, extra_info, source)
+                VALUES %s
+                ON CONFLICT (movie_id, quality, server_name, extra_info) DO UPDATE SET
+                    url       = EXCLUDED.url,
+                    file_size = EXCLUDED.file_size,
+                    languages = EXCLUDED.languages,
+                    source    = 'scraped'
+                """,
+                deduped_records,
+                template="(%s, %s, %s, %s, %s, %s, %s, 'scraped')",
+            )
+
+        # ── Step 5: Acknowledge job inside same transaction ───────────
+        if not ack_job(cur, job_id, worker_id):
+            conn.rollback()
+            print(
+                f"   ⚠️ ACK failed for job {job_id}: lease expired during write. "
+                "Rolling back.",
+                flush=True,
+            )
+            return False
+
+        # ── Step 6: Commit ────────────────────────────────────────────
+        conn.commit()
+        cur.close()
+        print(
+            f"   ✅ DB Sync Complete (fenced): '{title}' "
+            f"({len(file_records)} file records)",
+            flush=True,
+        )
+        return True
+
+    except Exception as e:
+        print(f"   DB Save Error (fenced): {e}", flush=True)
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return False
+    finally:
+        if conn:
+            try:
+                conn.autocommit = True
+            except Exception:
+                pass
+            release_db_connection(conn)
+
+
+# =====================================================================
+# MODE: DISCOVERY  (Phase B — enqueue URLs into crawl_jobs)
+# =====================================================================
+async def run_discovery_mode(plugin, bot_id=1, total_bots=1,
+                              is_watchdog=False, priority=None):
+    """
+    Discovery-only run: discover URLs and push them into crawl_jobs.
+    Does NOT process / extract any movie pages.
+
+    Watchdog discovery: top WATCHDOG_LIMIT URLs, priority=10
+    Matrix discovery:   full sitemap split across bots, priority=100
+    """
+    if priority is None:
+        priority = 10 if is_watchdog else 100
+
+    mode_label = "watchdog-discovery" if is_watchdog else "matrix-discovery"
+    print("=" * 60, flush=True)
+    print(
+        f"DISCOVERY MODE | Site: {plugin.SITE_NAME} | "
+        f"{'Watchdog' if is_watchdog else f'Matrix Bot #{bot_id}/{total_bots}'} "
+        f"| Priority: {priority}",
+        flush=True,
+    )
+    print(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print("=" * 60, flush=True)
+
+    run_id = create_crawl_run(plugin.SITE_NAME, mode_label, bot_id, total_bots)
+    counters = {"discovered": 0, "processed": 0, "inserted": 0,
+                "updated": 0, "skipped": 0, "failed": 0}
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox", "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            ctx = await browser.new_context(user_agent=USER_AGENT)
+
+            if is_watchdog:
+                all_urls = await plugin.get_all_urls(ctx, watchdog_mode=True)
+                urls = all_urls[: plugin.WATCHDOG_LIMIT]
+            else:
+                all_urls = await plugin.get_all_urls(ctx)
+                total = len(all_urls)
+                chunk_size = max(1, total // total_bots)
+                start_idx  = (bot_id - 1) * chunk_size
+                end_idx    = total if bot_id == total_bots else start_idx + chunk_size
+                urls = all_urls[start_idx:end_idx]
+
+            await ctx.close()
+            await browser.close()
+
+        if not urls:
+            print("No URLs discovered. Exiting.", flush=True)
+            finish_crawl_run(run_id, "success", counters)
+            return
+
+        counters["discovered"] = len(urls)
+        print(f"Discovered {len(urls)} URLs. Checking scraped_urls...", flush=True)
+
+        # Filter out already-scraped URLs (unless FORCE_REFRESH)
+        if not FORCE_REFRESH:
+            already_scraped = get_already_scraped_urls_bulk(plugin.SITE_NAME, urls)
+            new_urls = [u for u in urls if u not in already_scraped]
+            counters["skipped"] = len(already_scraped)
+            print(
+                f"  {len(already_scraped)} already in scraped_urls → skipping.\n"
+                f"  {len(new_urls)} new URLs → enqueueing.",
+                flush=True,
+            )
+        else:
+            new_urls = urls
+            print(
+                f"  FORCE_REFRESH=true — enqueueing all {len(new_urls)} URLs.",
+                flush=True,
+            )
+
+        # Enqueue into crawl_jobs
+        conn = get_db_connection()
+        try:
+            jobs = [(plugin.SITE_NAME, url) for url in new_urls]
+            inserted = enqueue_jobs_bulk(conn, jobs, priority=priority)
+            counters["inserted"] = inserted
+            print(
+                f"  Enqueued {inserted} new jobs (priority={priority}).",
+                flush=True,
+            )
+        finally:
+            release_db_connection(conn)
+
+        finish_crawl_run(run_id, "success", counters)
+        print(f"\nDiscovery complete.", flush=True)
+
+    except Exception as exc:
+        finish_crawl_run(run_id, "failed", counters, error_message=str(exc))
+        raise
+
+
+# =====================================================================
+# MODE: WORKER  (Phase B — drain crawl_jobs queue)
+# =====================================================================
+async def run_worker_mode(plugin, max_jobs: int = 0):
+    """
+    Continuous worker: claim jobs from crawl_jobs, process them with
+    the existing extraction/bypass/TMDB pipeline, then commit via the
+    fenced transaction.
+
+    max_jobs: if > 0, stop after processing this many jobs (for GHA
+              bounded execution). If 0, run until the time limit.
+
+    Connection budget: DB_POOL_SIZE >= MAX_ACTIVE_JOBS_PER_WORKER + 2
+    (1 dedicated for HeartbeatManager, 1 buffer, rest for scraping).
+    """
+    MAX_ACTIVE = max(1, min(CONCURRENCY_LIMIT, DB_POOL_SIZE - 2))
+
+    print("=" * 60, flush=True)
+    print(
+        f"WORKER MODE | Site: {plugin.SITE_NAME} | Worker: {WORKER_ID} "
+        f"| Max active: {MAX_ACTIVE} | Pool: {DB_POOL_SIZE}",
+        flush=True,
+    )
+    print(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print("=" * 60, flush=True)
+
+    start_time = time.time()
+    run_id = create_crawl_run(plugin.SITE_NAME, "worker")
+    counters = {"discovered": 0, "processed": 0, "inserted": 0,
+                "updated": 0, "skipped": 0, "failed": 0}
+    last_crawl_run_update = time.time()
+
+    # Graceful shutdown support
+    _shutdown = threading.Event()
+    _active_jobs: dict = {}   # job_id -> asyncio.Task
+
+    def _handle_sigterm(sig, frame):
+        print("\n⚠️ SIGTERM received — stopping gracefully.", flush=True)
+        _shutdown.set()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigterm)
+
+    # Start multiplexed heartbeat manager
+    hb = HeartbeatManager(get_db_connection, release_db_connection)
+    hb.start()
+
+    # Recover any stale jobs from previous workers first
+    conn = get_db_connection()
+    try:
+        recovered = recover_expired_leases(conn)
+        if recovered:
+            print(f"Sweeper: recovered {recovered} stale jobs from previous runs.", flush=True)
+        stats = get_queue_stats(conn)
+        print(f"Queue stats: {stats}", flush=True)
+    finally:
+        release_db_connection(conn)
+
+    sem = asyncio.Semaphore(MAX_ACTIVE)
+    jobs_done = 0
+
+    async def process_one_job(job: dict):
+        nonlocal jobs_done
+        job_id   = job["id"]
+        url      = job["url"]
+        site     = job["site_name"]
+        w_id     = job["claimed_by"]
+
+        hb.register(job_id)
+        print(f"\n📥 Worker claimed job {job_id}: {url}", flush=True)
+
+        conn_mark = None
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox", "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                )
+                main_ctx = await browser.new_context(user_agent=USER_AGENT)
+                await main_ctx.route(
+                    "**/*",
+                    lambda route: (
+                        route.abort()
+                        if route.request.resource_type in ["image", "media", "font"]
+                        else route.continue_()
+                    ),
+                )
+                page = await main_ctx.new_page()
+
+                try:
+                    await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                    scraped_data = await plugin.extract_movie_data(page)
+                except Exception as exc:
+                    await page.close() if not page.is_closed() else None
+                    await main_ctx.close()
+                    await browser.close()
+                    err_msg = str(exc)
+                    conn_f = get_db_connection()
+                    try:
+                        new_status = fail_job(conn_f, job_id, w_id, err_msg)
+                    finally:
+                        release_db_connection(conn_f)
+                    print(f"   ❌ Page load/extract error for job {job_id}: {exc} → {new_status}", flush=True)
+                    counters["failed"] += 1
+                    return
+                finally:
+                    if not page.is_closed():
+                        await page.close()
+
+                if not scraped_data:
+                    await main_ctx.close()
+                    await browser.close()
+                    conn_f = get_db_connection()
+                    try:
+                        fail_job(conn_f, job_id, w_id, "Plugin returned no data")
+                    finally:
+                        release_db_connection(conn_f)
+                    conn_mark = get_db_connection()
+                    try:
+                        mark_url_scraped(url, site, None, "no_links")
+                    finally:
+                        release_db_connection(conn_mark)
+                        conn_mark = None
+                    counters["skipped"] += 1
+                    return
+
+                raw_links = scraped_data.pop("raw_download_links", [])
+                if not raw_links:
+                    await main_ctx.close()
+                    await browser.close()
+                    conn_f = get_db_connection()
+                    try:
+                        fail_job(conn_f, job_id, w_id, "No download links found")
+                    finally:
+                        release_db_connection(conn_f)
+                    await asyncio.to_thread(mark_url_scraped, url, site, None, "no_links")
+                    counters["skipped"] += 1
+                    return
+
+                # Bypass
+                try:
+                    bypassed_links = await plugin.bypass_links(main_ctx, browser, raw_links)
+                except Exception as exc:
+                    bypassed_links = []
+
+                bypassed_links = [b for b in bypassed_links if b.get("direct_links")]
+                await main_ctx.close()
+                await browser.close()
+
+                if not bypassed_links:
+                    conn_f = get_db_connection()
+                    try:
+                        fail_job(conn_f, job_id, w_id, "No valid links after bypass")
+                    finally:
+                        release_db_connection(conn_f)
+                    await asyncio.to_thread(mark_url_scraped, url, site, None, "no_links")
+                    counters["skipped"] += 1
+                    return
+
+            # Hash check
+            new_link_hash = compute_link_hash(bypassed_links)
+
+            # TMDB enrichment
+            fixed_data = fix_movie_details(scraped_data, movie_url=url)
+            if scraped_data.get("is_adult_bypass"):
+                tmdb_data = {
+                    "Title": fixed_data.get("Raw_Title", ""),
+                    "Poster": fixed_data.get("Poster", ""),
+                    "Genre": fixed_data.get("Genre", "Hot Web Series"),
+                    "Cast": fixed_data.get("Stars", "N/A"),
+                    "Description": fixed_data.get("Description", "N/A"),
+                    "TMDb_Rating": "N/A", "is_tv": True, "seasons_data": {}
+                }
+                fixed_data["Type"] = "Hot Web Series"
+            else:
+                tmdb_data = await asyncio.to_thread(get_tmdb_details, fixed_data)
+
+            # Check heartbeat before fenced write
+            if hb.is_lost(job_id):
+                print(f"   ⚠️ Ownership lost (heartbeat) before write — aborting job {job_id}.", flush=True)
+                counters["failed"] += 1
+                return
+
+            db_payload = {
+                "url": url,
+                "raw_title": fixed_data.get("Raw_Title", ""),
+                "clean_title": fixed_data.get("Search_Query", ""),
+                "Type": fixed_data.get("Type", "Movies"),
+                "Default_Season": fixed_data.get("Default_Season"),
+                "Year": fixed_data.get("Year", "N/A"),
+                "IMDb": fixed_data.get("IMDb", "N/A"),
+                "tmdb_data": tmdb_data,
+                "Genre": fixed_data.get("Genre", "N/A"),
+                "Stars": fixed_data.get("Stars", "N/A"),
+                "Language": fixed_data.get("Language", "N/A"),
+                "Description": fixed_data.get("Description", "N/A"),
+                "bypassed_links": bypassed_links,
+            }
+
+            # Fenced DB write — includes ACK inside transaction
+            success = await asyncio.to_thread(
+                fenced_save_movie_to_db, db_payload, job_id, w_id, hb
+            )
+
+            if success:
+                await asyncio.to_thread(
+                    mark_url_scraped, url, site, new_link_hash, "ok"
+                )
+                counters["inserted"] += 1
+                jobs_done += 1
+            else:
+                counters["failed"] += 1
+
+        except Exception as exc:
+            print(f"   ❌ Unhandled worker error for job {job_id}: {exc}", flush=True)
+            conn_f = get_db_connection()
+            try:
+                fail_job(conn_f, job_id, w_id, str(exc))
+            finally:
+                release_db_connection(conn_f)
+            counters["failed"] += 1
+        finally:
+            counters["processed"] += 1
+            hb.unregister(job_id)
+
+    # ── Main worker polling loop ──────────────────────────────────────
+    try:
+        while not _shutdown.is_set():
+            if time.time() - start_time > MAX_RUN_TIME_SECONDS:
+                print("\n⏰ Time limit reached — stopping gracefully.", flush=True)
+                break
+
+            if max_jobs > 0 and jobs_done >= max_jobs:
+                print(f"\n✅ Reached max_jobs={max_jobs}. Stopping.", flush=True)
+                break
+
+            # Periodic crawl_runs update (every 30 min)
+            if time.time() - last_crawl_run_update > 1800:
+                # In-place update for long-running worker session
+                conn_u = get_db_connection()
+                try:
+                    c = conn_u.cursor()
+                    c.execute(
+                        """
+                        UPDATE crawl_runs SET
+                            urls_processed = %s,
+                            urls_inserted  = %s,
+                            urls_failed    = %s
+                        WHERE id = %s;
+                        """,
+                        (counters["processed"], counters["inserted"],
+                         counters["failed"], run_id),
+                    )
+                    conn_u.commit()
+                    c.close()
+                finally:
+                    release_db_connection(conn_u)
+                last_crawl_run_update = time.time()
+
+            # Try to claim a job
+            async with sem:
+                conn_c = get_db_connection()
+                try:
+                    job = claim_next_job(
+                        conn_c, site_name=plugin.SITE_NAME, worker_id=WORKER_ID
+                    )
+                finally:
+                    release_db_connection(conn_c)
+
+                if job is None:
+                    # Queue is empty — wait before polling again
+                    print("   Queue empty. Waiting 10s...", flush=True)
+                    await asyncio.sleep(10)
+                    continue
+
+                asyncio.ensure_future(process_one_job(job))
+
+    finally:
+        # Let active tasks drain (up to 2 minutes)
+        print("\n🛑 Worker shutting down — waiting for active jobs...", flush=True)
+        for _ in range(24):   # 24 × 5s = 2 minutes
+            if not _active_jobs:
+                break
+            await asyncio.sleep(5)
+
+        hb.stop()
+        finish_crawl_run(run_id, "success", counters)
+        print(
+            f"\nWorker finished. Processed={counters['processed']}, "
+            f"Inserted={counters['inserted']}, Failed={counters['failed']}",
+            flush=True,
+        )
+
+
 async def scrape_and_save_movie(
     movie_url, plugin, browser, main_context, sem,
     is_watchdog=False, site_name="", existing_link_hash=None,
@@ -1573,6 +2305,8 @@ Examples:
   python main.py --site filmyzilla --mode matrix  --bot_id 1 --total_bots 5
   python main.py --site hdhub4u    --mode watchdog
   python main.py --site mkvcinemas --mode matrix  --bot_id 3 --total_bots 10
+  python main.py --site filmyzilla --mode discovery           # Phase B: seed queue
+  python main.py --site filmyzilla --mode worker              # Phase B: drain queue
         """,
     )
     parser.add_argument(
@@ -1585,8 +2319,13 @@ Examples:
         "--mode",
         type=str,
         required=True,
-        choices=["matrix", "watchdog"],
-        help="'matrix' for bulk historical, 'watchdog' for daily sync",
+        choices=["matrix", "watchdog", "discovery", "worker"],
+        help=(
+            "'matrix': bulk historical scrape (Phase A); "
+            "'watchdog': daily top-N sync (Phase A); "
+            "'discovery': Phase B — discover URLs and push to queue; "
+            "'worker': Phase B — drain queue and process URLs"
+        ),
     )
     parser.add_argument(
         "--bot_id",
@@ -1605,6 +2344,14 @@ Examples:
 
     # ── Validate ─────────────────────────────────────────────────────
     if args.mode == "matrix" and args.bot_id > args.total_bots:
+        print(
+            f"❌ Error: bot_id ({args.bot_id}) cannot exceed "
+            f"total_bots ({args.total_bots})"
+        )
+        sys.exit(1)
+
+    # discovery mode with matrix bot splitting also needs validation
+    if args.mode == "discovery" and args.bot_id > args.total_bots:
         print(
             f"❌ Error: bot_id ({args.bot_id}) cannot exceed "
             f"total_bots ({args.total_bots})"
@@ -1654,6 +2401,23 @@ Examples:
             asyncio.run(run_matrix_mode(plugin, args.bot_id, args.total_bots))
         elif args.mode == "watchdog":
             asyncio.run(run_watchdog_mode(plugin))
+        elif args.mode == "discovery":
+            # Phase B: discovery-only — push URLs into crawl_jobs
+            # is_watchdog=True slices top WATCHDOG_LIMIT; False uses full sitemap
+            is_wd = os.environ.get("DISCOVERY_WATCHDOG", "false").lower() == "true"
+            asyncio.run(
+                run_discovery_mode(
+                    plugin,
+                    bot_id=args.bot_id,
+                    total_bots=args.total_bots,
+                    is_watchdog=is_wd,
+                )
+            )
+        elif args.mode == "worker":
+            # Phase B: worker — drain crawl_jobs
+            # MAX_JOBS env var for GHA bounded execution
+            max_jobs = int(os.environ.get("MAX_WORKER_JOBS", "0"))
+            asyncio.run(run_worker_mode(plugin, max_jobs=max_jobs))
     finally:
         shutdown_db_pool()
 
