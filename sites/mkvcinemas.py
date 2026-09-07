@@ -11,7 +11,7 @@ from sites.base import BaseSitePlugin
 
 class SitePlugin(BaseSitePlugin):
     SITE_NAME = "MKVCinemas"
-    TARGET_WEBSITE = "https://mkvcinemas.hn"
+    TARGET_WEBSITE = "https://mkvcinemas.tl"
     WATCHDOG_LIMIT = 50
 
     HEADERS = {
@@ -32,16 +32,37 @@ class SitePlugin(BaseSitePlugin):
         print(f"📥 Fetching {self.SITE_NAME} urls...", flush=True)
         urls = []
         try:
-            sitemap_url = f"{self.TARGET_WEBSITE}/sitemap_posts.xml"
-            resp = requests.get(sitemap_url, headers=self.HEADERS, timeout=20)
-            if resp.status_code == 200:
+            sitemap_index_url = f"{self.TARGET_WEBSITE}/sitemap_index.xml"
+            print(f"   Checking index: {sitemap_index_url}", flush=True)
+            
+            resp = requests.get(sitemap_index_url, headers=self.HEADERS, timeout=20)
+            sitemap_urls = []
+            
+            if resp.status_code == 200 and "xml" in resp.headers.get("Content-Type", "").lower():
                 locs = re.findall(r'<loc>(.*?)</loc>', resp.text)
                 for loc in locs:
-                    if '/category/' not in loc and '/page/' not in loc and '/tag/' not in loc:
-                        urls.append(loc)
-                print(f"✅ Discovered {len(urls)} URLs from sitemap!", flush=True)
+                    if 'post-sitemap' in loc:
+                        sitemap_urls.append(loc)
+                print(f"   Found {len(sitemap_urls)} post sitemaps in index.", flush=True)
             else:
-                print(f"❌ Sitemap fetch error, status: {resp.status_code}", flush=True)
+                print(f"   ⚠️ Sitemap index unavailable (Status: {resp.status_code}, Type: {resp.headers.get('Content-Type')}). Falling back to post-sitemap1.xml", flush=True)
+                sitemap_urls = [f"{self.TARGET_WEBSITE}/post-sitemap1.xml"]
+                
+            for s_url in sitemap_urls:
+                print(f"   Fetching sitemap: {s_url}", flush=True)
+                s_resp = requests.get(s_url, headers=self.HEADERS, timeout=20)
+                if s_resp.status_code == 200 and "xml" in s_resp.headers.get("Content-Type", "").lower():
+                    s_locs = re.findall(r'<loc>(.*?)</loc>', s_resp.text)
+                    for loc in s_locs:
+                        if '/category/' not in loc and '/page/' not in loc and '/tag/' not in loc:
+                            urls.append(loc)
+                else:
+                    print(f"   ❌ Failed to fetch {s_url} (Status: {s_resp.status_code}, Type: {s_resp.headers.get('Content-Type')})", flush=True)
+
+            # Preserve ordering. RankMath usually has latest posts in the earliest sitemaps, but some versions reverse it.
+            # We don't need to manually sort because main.py watchdog limit will grab the first N URLs from this list.
+            print(f"✅ Discovered {len(urls)} URLs from sitemaps!", flush=True)
+
         except Exception as e:
             print(f"❌ Sitemap fetch error: {e}", flush=True)
             
