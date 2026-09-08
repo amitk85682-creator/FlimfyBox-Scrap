@@ -55,7 +55,8 @@ class SitePlugin(BaseSitePlugin):
                     s_locs = re.findall(r'<loc>(.*?)</loc>', s_resp.text)
                     for loc in s_locs:
                         if '/category/' not in loc and '/page/' not in loc and '/tag/' not in loc:
-                            urls.append(loc)
+                            if loc.strip('/') != self.TARGET_WEBSITE.strip('/'):
+                                urls.append(loc)
                 else:
                     print(f"   ❌ Failed to fetch {s_url} (Status: {s_resp.status_code}, Type: {s_resp.headers.get('Content-Type')})", flush=True)
 
