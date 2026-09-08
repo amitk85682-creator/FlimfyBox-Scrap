@@ -118,7 +118,7 @@ jobs:
           if [ "$SITE" == "all" ]; then
             if [ "$MODE" == "worker" ]; then
               # Start with 2 workers conservatively for continuous operation
-              echo 'site_matrix=["filmyzilla","hdhub4u"]' >> "$GITHUB_OUTPUT"
+              echo 'site_matrix=["filmyzilla","hdhub4u","mkvcinemas"]' >> "$GITHUB_OUTPUT"
             else
               echo 'site_matrix=["filmyzilla","hdhub4u","mkvcinemas"]' >> "$GITHUB_OUTPUT"
             fi
