@@ -130,7 +130,7 @@ jobs:
           TOTAL="${{ github.event.inputs.total_bots || '5' }}"
           echo "total_bots=$TOTAL" >> "$GITHUB_OUTPUT"
 
-          if [ "$MODE" == "watchdog" ] || [ "$MODE" == "worker" ]; then
+          if [ "$MODE" == "watchdog" ] || [ "$MODE" == "worker" ] || [ "$DISC_WD" == "true" ]; then
             # Watchdog and worker only need 1 bot per site
             echo 'bot_matrix=[1]' >> "$GITHUB_OUTPUT"
           else
