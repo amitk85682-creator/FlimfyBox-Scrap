@@ -177,7 +177,7 @@ jobs:
           DATABASE_URL:         ${{ secrets.DATABASE_URL }}
           TMDB_API_KEY:         ${{ secrets.TMDB_API_KEY }}
           FORCE_REFRESH:        ${{ needs.setup.outputs.force_refresh }}
-          DB_POOL_SIZE:         "4"  # TEMP DIAGNOSTIC: forces MAX_ACTIVE=2 — revert after test
+          DB_POOL_SIZE:         "4"
           DISCOVERY_WATCHDOG:   ${{ needs.setup.outputs.discovery_watchdog }}
           MAX_WORKER_JOBS:      ${{ needs.setup.outputs.max_worker_jobs }}
           PYTHONUNBUFFERED:     "1"
