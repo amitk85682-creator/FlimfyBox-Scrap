@@ -116,11 +116,13 @@ jobs:
           # ── Determine site list ────────────────────────────────────
           SITE="${{ github.event.inputs.site || 'all' }}"
           if [ "$SITE" == "all" ]; then
+            # TEMP PAUSE (Cloudflare Block): Removed "mkvcinemas" from the automated 'all' array.
+            # To re-enable MKVCinemas, add it back to this JSON array: 'site_matrix=["filmyzilla","hdhub4u","mkvcinemas"]'
             if [ "$MODE" == "worker" ]; then
               # Start with 2 workers conservatively for continuous operation
-              echo 'site_matrix=["filmyzilla","hdhub4u","mkvcinemas"]' >> "$GITHUB_OUTPUT"
+              echo 'site_matrix=["filmyzilla","hdhub4u"]' >> "$GITHUB_OUTPUT"
             else
-              echo 'site_matrix=["filmyzilla","hdhub4u","mkvcinemas"]' >> "$GITHUB_OUTPUT"
+              echo 'site_matrix=["filmyzilla","hdhub4u"]' >> "$GITHUB_OUTPUT"
             fi
           else
             echo "site_matrix=[\"$SITE\"]" >> "$GITHUB_OUTPUT"
