@@ -9,6 +9,9 @@ import re
 import requests
 from sites.base import BaseSitePlugin
 
+class CloudflareBlockedError(Exception):
+    pass
+
 class SitePlugin(BaseSitePlugin):
     SITE_NAME = "MKVCinemas"
     TARGET_WEBSITE = "https://mkvcinemas.tl"
@@ -80,6 +83,10 @@ class SitePlugin(BaseSitePlugin):
             raw_h1 = await page.locator("h1").first.inner_text(timeout=10000)
             raw_h1 = re.sub(r"\s+", " ", raw_h1 or "").strip()
             
+            page_title = await page.title()
+            if "Just a moment" in page_title or "Attention Required" in page_title:
+                raise CloudflareBlockedError("CLOUDFLARE_BLOCKED")
+            
             poster = await page.evaluate("() => { let img = document.querySelector('img.wp-post-image'); return img ? img.src : ''; }")
             
             details = {
@@ -107,6 +114,10 @@ class SitePlugin(BaseSitePlugin):
                 await dl_page.goto(filesdl_master_url, timeout=60000, wait_until="domcontentloaded")
                 await dl_page.wait_for_timeout(3000)
                 
+                dl_page_title = await dl_page.title()
+                if "Just a moment" in dl_page_title or "Attention Required" in dl_page_title:
+                    raise CloudflareBlockedError("CLOUDFLARE_BLOCKED")
+                
                 raw_links = await dl_page.evaluate(r'''() => {
                     let results = [];
                     let buttons = Array.from(document.querySelectorAll('a')).filter(a => (a.innerText || "").toLowerCase().includes('hubcloud'));
@@ -120,6 +131,8 @@ class SitePlugin(BaseSitePlugin):
                     });
                     return results;
                 }''')
+            except CloudflareBlockedError:
+                raise
             except Exception as e:
                 print(f"   ⚠️ DL Page error: {e}", flush=True)
             finally:
@@ -128,6 +141,8 @@ class SitePlugin(BaseSitePlugin):
             details["raw_download_links"] = raw_links
             return details
 
+        except CloudflareBlockedError:
+            raise
         except Exception as e:
             print(f"   ⚠️ Extract error: {e}", flush=True)
             return None
@@ -140,6 +155,10 @@ class SitePlugin(BaseSitePlugin):
         try:
             await page.goto(hubdrive_url, timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(4000)
+            
+            page_title = await page.title()
+            if "Just a moment" in page_title or "Attention Required" in page_title:
+                raise CloudflareBlockedError("CLOUDFLARE_BLOCKED")
             
             hubcloud_url = await page.evaluate(r'''() => {
                 let links = Array.from(document.querySelectorAll('a, button'));
@@ -188,6 +207,8 @@ class SitePlugin(BaseSitePlugin):
                 return results;
             }''')
             return final_servers
+        except CloudflareBlockedError:
+            raise
         except Exception as e:
             print(f"   ⚠️ bypass_hubcloud_chain error: {e}", flush=True)
             return None
@@ -202,6 +223,10 @@ class SitePlugin(BaseSitePlugin):
             try:
                 await page.goto(item["url"], timeout=60000, wait_until="domcontentloaded")
                 await page.wait_for_timeout(3000)
+                
+                page_title = await page.title()
+                if "Just a moment" in page_title or "Attention Required" in page_title:
+                    raise CloudflareBlockedError("CLOUDFLARE_BLOCKED")
                 
                 extracted = await page.evaluate(r'''() => {
                     let docText = document.body.innerText;
@@ -240,6 +265,8 @@ class SitePlugin(BaseSitePlugin):
                         if hc_servers:
                             servers.extend(hc_servers)
                             
+            except CloudflareBlockedError:
+                raise
             except Exception as e:
                 print(f"   ⚠️ Server bypass error: {e}", flush=True)
             finally:
@@ -255,6 +282,8 @@ class SitePlugin(BaseSitePlugin):
         results = await asyncio.gather(*tasks, return_exceptions=True)
         valid = []
         for r in results:
+            if isinstance(r, CloudflareBlockedError):
+                raise r
             if isinstance(r, Exception): continue
             if r and r.get("direct_links"): valid.append(r)
         return valid
