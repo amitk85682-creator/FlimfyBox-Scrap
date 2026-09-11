@@ -101,6 +101,65 @@ def fetch_health_metrics():
                 "urls_failed": fail,
                 "duration_secs": round(duration, 2) if duration else None
             }
+            
+        # 6. Velocity / Throughput (Last 24 Hours)
+        cur.execute("""
+            SELECT 
+                site_name,
+                COUNT(*) FILTER (WHERE status = 'completed' AND updated_at >= NOW() - INTERVAL '24 hours') as completed_24h,
+                COUNT(*) FILTER (WHERE status = 'dead' AND updated_at >= NOW() - INTERVAL '24 hours') as dead_24h,
+                COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') as new_24h,
+                AVG(EXTRACT(EPOCH FROM (updated_at - claimed_at))) FILTER (WHERE status = 'completed' AND claimed_at IS NOT NULL AND updated_at >= NOW() - INTERVAL '24 hours') as avg_duration_secs
+            FROM crawl_jobs 
+            WHERE updated_at >= NOW() - INTERVAL '24 hours' OR created_at >= NOW() - INTERVAL '24 hours'
+            GROUP BY site_name;
+        """)
+        
+        metrics["velocity"] = {
+            "overall": {
+                "completed_per_hour": 0,
+                "failed_per_hour": 0,
+                "avg_job_duration_secs": None,
+                "backlog_growth_24h": 0,
+                "estimated_drain_hours": None
+            },
+            "per_site": {}
+        }
+        
+        total_completed = 0
+        total_dead = 0
+        total_new = 0
+        sum_duration = 0
+        dur_count = 0
+        
+        for site, comp_24h, dead_24h, new_24h, avg_dur in cur.fetchall():
+            comp_24h = comp_24h or 0
+            dead_24h = dead_24h or 0
+            new_24h = new_24h or 0
+            
+            total_completed += comp_24h
+            total_dead += dead_24h
+            total_new += new_24h
+            if avg_dur:
+                sum_duration += avg_dur * comp_24h
+                dur_count += comp_24h
+                
+            metrics["velocity"]["per_site"][site] = {
+                "completed_per_hour": round(comp_24h / 24.0, 2),
+                "failed_per_hour": round(dead_24h / 24.0, 2),
+                "avg_job_duration_secs": round(avg_dur, 2) if avg_dur else None,
+                "backlog_growth_24h": new_24h - (comp_24h + dead_24h)
+            }
+            
+        metrics["velocity"]["overall"]["completed_per_hour"] = round(total_completed / 24.0, 2)
+        metrics["velocity"]["overall"]["failed_per_hour"] = round(total_dead / 24.0, 2)
+        metrics["velocity"]["overall"]["backlog_growth_24h"] = total_new - (total_completed + total_dead)
+        if dur_count > 0:
+            metrics["velocity"]["overall"]["avg_job_duration_secs"] = round(sum_duration / dur_count, 2)
+            
+        total_backlog = metrics["overall"]["pending"] + metrics["overall"]["retry_wait"]
+        if total_completed > 0:
+            metrics["velocity"]["overall"]["estimated_drain_hours"] = round(total_backlog / (total_completed / 24.0), 2)
 
     finally:
         if cur:
@@ -118,11 +177,19 @@ def print_human_readable(metrics):
     print("\n[ Overall Status ]")
     for k, v in metrics["overall"].items():
         print(f"  {k:12}: {v}")
+        
+    print("\n[ Velocity (Last 24h) ]")
+    for k, v in metrics["velocity"]["overall"].items():
+        print(f"  {k:22}: {v}")
 
-    print("\n[ Per-Site Status ]")
+    print("\n[ Per-Site Status & Velocity ]")
     for site, stats in metrics["per_site"].items():
         s = " ".join(f"{k}={v}" for k, v in stats.items() if v > 0 or k == 'pending')
         print(f"  {site:12}: {s}")
+        if site in metrics["velocity"]["per_site"]:
+            v_stats = metrics["velocity"]["per_site"][site]
+            v_s = " ".join(f"{k}={v}" for k, v in v_stats.items() if v is not None)
+            print(f"  {'':12}  > {v_s}")
 
     print("\n[ Age Metrics ]")
     for k, v in metrics["ages"].items():

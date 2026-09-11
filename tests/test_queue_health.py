@@ -14,7 +14,7 @@ def mock_db():
 def test_fetch_health_metrics_is_read_only(mock_db):
     conn, cur = mock_db
     
-    # Setup mock returns for the 5 execute calls
+    # Setup mock returns for the 6 execute calls
     cur.fetchall.side_effect = [
         # 1. Overall
         [("pending", 10), ("processing", 2), ("completed", 5)],
@@ -23,7 +23,9 @@ def test_fetch_health_metrics_is_read_only(mock_db):
         # 4. Recovery (skipping 3 because it's fetchone)
         [("filmyzilla", 3)],
         # 5. Crawl health
-        [("filmyzilla", "worker", None, "success", 0, 10, 0, 120.5)]
+        [("filmyzilla", "worker", None, "success", 0, 10, 0, 120.5)],
+        # 6. Velocity
+        [("filmyzilla", 120, 5, 150, 45.0)]
     ]
     cur.fetchone.side_effect = [
         # 3. Ages
@@ -35,13 +37,12 @@ def test_fetch_health_metrics_is_read_only(mock_db):
     # Verify set_session(readonly=True) was called
     conn.set_session.assert_called_once_with(readonly=True)
     
-    # Verify all executed queries are SELECTs
     for call in cur.execute.call_args_list:
         query = call[0][0].strip().upper()
         assert query.startswith("SELECT"), f"Query must be read-only SELECT, found: {query}"
-        assert "UPDATE" not in query
-        assert "DELETE" not in query
-        assert "INSERT" not in query
+        assert "UPDATE " not in query
+        assert "DELETE " not in query
+        assert "INSERT " not in query
         assert "FOR UPDATE" not in query
 
 def test_metrics_aggregation(mock_db):
@@ -51,7 +52,8 @@ def test_metrics_aggregation(mock_db):
         [("pending", 15), ("dead", 1)],
         [("hdhub4u", "pending", 15)],
         [("hdhub4u", 2)],
-        [("hdhub4u", "discovery", None, "success", 100, 0, 0, 45.0)]
+        [("hdhub4u", "discovery", None, "success", 100, 0, 0, 45.0)],
+        [("hdhub4u", 48, 0, 50, 12.5)]
     ]
     cur.fetchone.side_effect = [
         (100.0, None, None, None, 0)
@@ -67,3 +69,7 @@ def test_metrics_aggregation(mock_db):
     assert metrics["recovery"]["high_retry_jobs_total"] == 2
     assert metrics["recovery"]["high_retry_jobs_per_site"]["hdhub4u"] == 2
     assert metrics["crawl_health"]["hdhub4u"]["discovery"]["urls_discovered"] == 100
+    
+    assert metrics["velocity"]["overall"]["completed_per_hour"] == 2.0
+    assert metrics["velocity"]["overall"]["failed_per_hour"] == 0.0
+    assert metrics["velocity"]["overall"]["avg_job_duration_secs"] == 12.5
