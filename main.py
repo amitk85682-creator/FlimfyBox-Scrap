@@ -99,6 +99,35 @@ USER_AGENT = (
 # NEVER increase this without also reducing matrix concurrency.
 DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "3"))
 
+# =====================================================================
+# SITE CONFIGURATION
+# =====================================================================
+DEFAULT_SITE_CONFIG = {
+    "enabled": True,
+    "max_active": 2,
+}
+
+SITE_CONFIG = {
+    "filmyzilla": {
+        "max_active": 2,
+    },
+    "hdhub4u": {
+        "max_active": 2,
+    },
+    "mkvcinemas": {
+        "enabled": False,
+        "max_active": 2,
+    }
+}
+
+def get_site_config(site_name):
+    """Retrieve site-aware configuration with safe defaults."""
+    config = DEFAULT_SITE_CONFIG.copy()
+    config.update(SITE_CONFIG.get(site_name, {}))
+    # Ensure safe concurrency bounds based on DB pool size (reserve 2 for heartbeat/fetching)
+    max_safe_active = max(1, DB_POOL_SIZE - 2)
+    config["max_active"] = max(1, min(config["max_active"], max_safe_active))
+    return config
 
 # =====================================================================
 # DATABASE CONNECTION POOL
@@ -1564,7 +1593,8 @@ async def run_worker_mode(plugin, max_jobs: int = 0):
     Connection budget: DB_POOL_SIZE >= MAX_ACTIVE_JOBS_PER_WORKER + 2
     (1 dedicated for HeartbeatManager, 1 buffer, rest for scraping).
     """
-    MAX_ACTIVE = max(1, min(CONCURRENCY_LIMIT, DB_POOL_SIZE - 2))
+    site_conf = get_site_config(plugin.SITE_NAME)
+    MAX_ACTIVE = site_conf["max_active"]
 
     print("=" * 60, flush=True)
     print(
@@ -2424,6 +2454,12 @@ Examples:
             "⚠️  WARNING: TMDB_API_KEY not set. TMDB enrichment disabled.",
             flush=True,
         )
+
+    # ── Check Site Config ────────────────────────────────────────────
+    site_conf = get_site_config(plugin.SITE_NAME)
+    if not site_conf.get("enabled", True):
+        print(f"⏸️  Site '{plugin.SITE_NAME}' is disabled in configuration. Exiting gracefully.", flush=True)
+        return
 
     # ── Initialize DB (auto-create tables if not exist) ──────────────
     initialize_db()
