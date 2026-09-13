@@ -108,13 +108,13 @@ DEFAULT_SITE_CONFIG = {
 }
 
 SITE_CONFIG = {
-    "filmyzilla": {
+    "FilmyZilla": {
+        "max_active": 3, # TEMP MAX_ACTIVE=3 TEST
+    },
+    "HDHub4u": {
         "max_active": 2,
     },
-    "hdhub4u": {
-        "max_active": 2,
-    },
-    "mkvcinemas": {
+    "MKVCinemas": {
         "enabled": False,
         "max_active": 2,
     }
