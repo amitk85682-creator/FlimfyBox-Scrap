@@ -1599,12 +1599,20 @@ async def run_worker_mode(plugin, max_jobs: int = 0):
     hb = HeartbeatManager(get_db_connection, release_db_connection)
     hb.start()
 
-    # Recover any stale jobs from previous workers first
+    # Recover any stale jobs from previous workers and clean up old jobs
     conn = get_db_connection()
     try:
         recovered = recover_expired_leases(conn)
         if recovered:
             print(f"Sweeper: recovered {recovered} stale jobs from previous runs.", flush=True)
+            
+        try:
+            cleaned = cleanup_old_jobs(conn)
+            if cleaned:
+                print(f"Cleanup: removed {cleaned} old queue jobs.", flush=True)
+        except Exception as e:
+            print(f"⚠️ Cleanup failed safely: {e}", flush=True)
+            
         stats = get_queue_stats(conn)
         print(f"Queue stats: {stats}", flush=True)
     finally:
