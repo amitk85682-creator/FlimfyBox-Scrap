@@ -16,7 +16,7 @@ def test_plugin_properties(plugin):
 def test_cinejoy_site_config():
     # Test that get_site_config correctly resolves the lowercased key
     config = main.get_site_config("CineJoy")
-    assert config["enabled"] is False
+    assert config["enabled"] is True
     assert config["max_active"] == 1
 
 @patch("main.DB_POOL_SIZE", 4)

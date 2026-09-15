@@ -119,7 +119,7 @@ SITE_CONFIG = {
         "max_active": 2,
     },
     "cinejoy": {
-        "enabled": False,
+        "enabled": True,
         "max_active": 1,
     }
 }
