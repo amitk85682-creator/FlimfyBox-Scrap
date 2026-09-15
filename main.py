@@ -1610,6 +1610,11 @@ async def run_worker_mode(plugin, max_jobs: int = 0):
     print(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
     print("=" * 60, flush=True)
 
+    if plugin.SITE_NAME == "CineJoy":
+        print("ℹ️ Worker mode is queue-based.", flush=True)
+        print("ℹ️ CineJoy jobs must exist in crawl_jobs before worker can process them.", flush=True)
+        print("ℹ️ Use discovery first to seed CineJoy jobs.", flush=True)
+
     start_time = time.time()
     idle_timeout = int(os.environ.get("WORKER_IDLE_TIMEOUT", 60 if max_jobs > 0 else 0))
     idle_start = time.time()

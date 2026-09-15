@@ -119,14 +119,16 @@ jobs:
           if [ "$SITE" == "all" ]; then
             # TEMP PAUSE (Cloudflare Block): Removed "mkvcinemas" from the automated 'all' array.
             # To re-enable MKVCinemas, add it back to this JSON array: 'site_matrix=["filmyzilla","hdhub4u","mkvcinemas"]'
-            if [ "$MODE" == "worker" ]; then
-              # Start with 2 workers conservatively for continuous operation
+            if [ "${{ github.event_name }}" == "schedule" ]; then
               echo 'site_matrix=["filmyzilla","hdhub4u"]' >> "$GITHUB_OUTPUT"
+              RESOLVED="filmyzilla, hdhub4u"
             else
-              echo 'site_matrix=["filmyzilla","hdhub4u"]' >> "$GITHUB_OUTPUT"
+              echo 'site_matrix=["filmyzilla","hdhub4u","cinejoy"]' >> "$GITHUB_OUTPUT"
+              RESOLVED="filmyzilla, hdhub4u, cinejoy"
             fi
           else
             echo "site_matrix=[\"$SITE\"]" >> "$GITHUB_OUTPUT"
+            RESOLVED="$SITE"
           fi
 
           # ── Determine bot IDs ──────────────────────────────────────
@@ -141,6 +143,15 @@ jobs:
             BOT_LIST=$(python3 -c "import json; print(json.dumps(list(range(1, int('$TOTAL')+1))))")
             echo "bot_matrix=$BOT_LIST" >> "$GITHUB_OUTPUT"
           fi
+
+          # ── Dispatch Logging ───────────────────────────────────────
+          echo "=========================================="
+          echo "UNIVERSAL SCRAPER DISPATCH"
+          echo "Trigger: ${{ github.event_name }}"
+          echo "Mode: $MODE"
+          echo "Requested site: $SITE"
+          echo "Resolved sites: [$RESOLVED]"
+          echo "=========================================="
 
   # ================================================================
   # SCRAPE: Fan out across site × bot_id
@@ -185,6 +196,11 @@ jobs:
           MAX_WORKER_JOBS:      ${{ needs.setup.outputs.max_worker_jobs }}
           PYTHONUNBUFFERED:     "1"
         run: |
+          echo "🚀 STARTING SCRAPER"
+          echo "Site: ${{ matrix.site }}"
+          echo "Mode: ${{ needs.setup.outputs.mode }}"
+          echo "Bot: ${{ matrix.bot_id }}/${{ needs.setup.outputs.total_bots }}"
+          
           python main.py \
             --site ${{ matrix.site }} \
             --mode ${{ needs.setup.outputs.mode }} \
