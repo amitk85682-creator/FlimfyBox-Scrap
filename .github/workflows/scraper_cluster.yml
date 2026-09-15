@@ -47,6 +47,7 @@ on:
           - filmyzilla
           - hdhub4u
           - mkvcinemas
+          - cinejoy
       total_bots:
         description: "Parallel bots per site (matrix/discovery mode only)"
         required: false

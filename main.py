@@ -117,13 +117,18 @@ SITE_CONFIG = {
     "mkvcinemas": {
         "enabled": False,
         "max_active": 2,
+    },
+    "cinejoy": {
+        "enabled": False,
+        "max_active": 1,
     }
 }
 
 def get_site_config(site_name):
     """Retrieve site-aware configuration with safe defaults."""
     config = DEFAULT_SITE_CONFIG.copy()
-    config.update(SITE_CONFIG.get(site_name, {}))
+    key = str(site_name).strip().lower()
+    config.update(SITE_CONFIG.get(key, {}))
     # Ensure safe concurrency bounds based on DB pool size (reserve 2 for heartbeat/fetching)
     max_safe_active = max(1, DB_POOL_SIZE - 2)
     config["max_active"] = max(1, min(config["max_active"], max_safe_active))
